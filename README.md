@@ -1,31 +1,31 @@
 
 Full model and loop ready to go. 
 To add the adapative layers increase layerB. They don't need to have the same number of layers or dimensions. Educational/experimental.
-
-@dataclass
-class Dimensions:
-    vocab: int
-    text_ctx: int
-    text_dims: int
-    text_head: int
-    text_layerA: int
-    text_layerB: int
-    text_act: str
-    text_debug: bool
-    text_dropout: float
-    text_checkpoint: bool
-    mels: int
-    audio_ctx: int
-    audio_dims: int
-    audio_head: int
-    audio_layerA: int
-    audio_layerB: int
-    audio_act: str
-    audio_debug: bool
-    audio_dropout: float
-    audio_checkpoint: bool
-    scale_embedding: float
-
+    
+    @dataclass
+    class Dimensions:
+        vocab: int
+        text_ctx: int
+        text_dims: int
+        text_head: int
+        text_layerA: int
+        text_layerB: int
+        text_act: str
+        text_debug: bool
+        text_dropout: float
+        text_checkpoint: bool
+        mels: int
+        audio_ctx: int
+        audio_dims: int
+        audio_head: int
+        audio_layerA: int
+        audio_layerB: int
+        audio_act: str
+        audio_debug: bool
+        audio_dropout: float
+        audio_checkpoint: bool
+        scale_embedding: float
+    
 
 
 ```python
