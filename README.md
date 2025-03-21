@@ -282,32 +282,6 @@ class rotary(nn.Module):
 
 
 
-    # def forward(self, x):
-    #     batch, self.ctx, *rest = x.size()
-    #     self.cycler.toggle_requires_grad()
-
-    #     x = x.view(batch, self.ctx, self.head, self.head_dim)
-    #     x = x.reshape(-1, self.head_dim)
-
-    #     x = self.rotate(x=x)
-    #     x = x @ self.matrix
-
-    #     x = x.view(batch, self.ctx, self.head, self.head_dim)
-
-    #     position = torch.arange(self.ctx, device=x.device, dtype=x.dtype).unsqueeze(1)
-    #     div_term = self.invf.unsqueeze(0)
-    #     sinusoid_inp = position * div_term
-
-    #     sin = torch.sin(sinusoid_inp).unsqueeze(0).unsqueeze(2)
-    #     cos = torch.cos(sinusoid_inp).unsqueeze(0).unsqueeze(2)
-
-    #     x1, x2 = x[..., ::2], x[..., 1::2]
-    #     x = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
-    #     x = x.view(batch, self.ctx, self.dims)
-    #     x = x * math.sqrt(self.dims)
-    #     return x
-
-
 def sinusoids(length, channels, max_timescale=10000):
     """Returns sinusoids for positional embedding"""
     assert channels % 2 == 0
