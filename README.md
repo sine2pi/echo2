@@ -1828,13 +1828,9 @@ if __name__ == "__main__":
     model = Echo(param=param).to('cuda')
     model.init_weights()
 
-    optimizer = torch.optim.Adafactor(params=model.parameters(), lr=0.025, 
-                                    beta2_decay=-0.8, eps=(1e-10, 1e-4), 
-                                    d=1.0, weight_decay=0.0, 
-                                    foreach=None, maximize=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01, eps=1e-6, betas=(0.9, 0.98))
+    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.5, total_iters=100000, last_epoch=-1)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, 
-                                                            last_epoch = -1, T_max=100000, eta_min=0)
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
     
     # for idx, m in enumerate(model.modules()): # uncomment to print model modules
