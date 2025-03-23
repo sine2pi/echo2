@@ -1,6 +1,6 @@
 
 Full model and loop ready to go. 
-To add the adapative layers increase layerB. They don't need to have the same number of layers or dimensions. Educational/experimental.
+To add the adapative layers increase layerB. They don't need to have the same number of layers or dimensions. Educational/experimental.  
     
     @dataclass
     class Dimensions:
