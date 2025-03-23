@@ -30,7 +30,7 @@ To add the adapative layers increase layerB. They don't need to have the same nu
 
 ```python
 
-
+# %%
 import os
 import math
 import warnings
@@ -46,7 +46,7 @@ import gzip
 import base64
 from datetime import datetime
 from itertools import chain
-from separated_attention import QueryModule, KeyModule, ValueModule, AttentionCombiner
+# from separated_attention import QueryModule, KeyModule, ValueModule, AttentionCombiner
 # Data handling libraries
 import torchaudio
 from einops import rearrange
@@ -62,7 +62,7 @@ import evaluate
 from datasets import load_dataset
 from transformers import WhisperTokenizer
 import transformers
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 from dataclasses import dataclass
 
 # Set up environment
@@ -84,7 +84,7 @@ class Dimensions:
     text_layerA: int
     text_layerB: int
     text_act: str
-    text_debug: bool
+    text_debug: int
     text_dropout: float
     text_checkpoint: bool
 
@@ -95,7 +95,7 @@ class Dimensions:
     audio_layerA: int
     audio_layerB: int
     audio_act: str
-    audio_debug: bool
+    audio_debug: int
     audio_dropout: float
     audio_checkpoint: bool
     scale_embedding: float
@@ -104,7 +104,6 @@ class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
         return super().forward(x.float()).type(x.dtype)
 
-
 class Linear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         return F.linear(
@@ -112,7 +111,6 @@ class Linear(nn.Linear):
             self.weight.to(x.dtype),
             None if self.bias is None else self.bias.to(x.dtype),
         )
-
 class Conv1d(nn.Conv1d):
     def _conv_forward(
         self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
@@ -120,9 +118,8 @@ class Conv1d(nn.Conv1d):
         return super()._conv_forward(
             x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
         )
-
-def _shape(self, tensor: torch.Tensor, seq_len: int, batch: int):
-    return tensor.view(batch, seq_len, self.head, self.head_dim).transpose(1, 2).contiguous()
+def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
+    return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
 
 class ParameterCycler:
     def __init__(self, parameters):
@@ -134,11 +131,11 @@ class ParameterCycler:
             param.requires_grad = i == self.current_idx
         self.current_idx = (self.current_idx + 1) % len(self.parameters)
 
-def _shape(self, tensor: torch.Tensor, seq_len: int, batch: int):
-    return tensor.view(batch, seq_len, self.head, self.head_dim).transpose(1, 2).contiguous()
+def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
+    return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
 
 
-
+# %%
 
 class rotary(nn.Module):
     def __init__(self, dims, head, freq=10000, debug=False):
@@ -164,16 +161,6 @@ class rotary(nn.Module):
         
         self.cycler = ParameterCycler(parameters=[self.dparam, self.matrix, self.invf, self.thetas, self.pairs, self.tscale, self.rscale])
 
-    def update_base(self, new_freq): 
-        self.freq = float(new_freq)  
-        invf = nn.Parameter(1.0 / (self.freq ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)))
-        invf.data.copy_(src=invf)
-        print(f"Base: {self.freq}")
-
-    def reset_parameters(self):
-        nn.init.orthogonal_(self.matrix)
-        nn.init.zeros_(self.thetas)
-
     def vectorize_rotations(self, flat):
         self.batch = flat.size(0)
         G_matrices = []
@@ -187,29 +174,37 @@ class rotary(nn.Module):
             G_combined = G_combined @ G
         return flat @ G_combined
 
+    def update_freq(self, new_freq):
+        if new_freq is not None and new_freq != self.freq:
+            self.freq = new_freq
+            invf = 1.0 / (self.freq ** (torch.arange(start=0, end=self.hhead_dim, step=2).float() / self.head_dim))
+            self.invf.data.copy_(invf)
+            self.update_pairs()
+
+    def update_pairs(self):
+        pairs = []
+        while len(pairs) < self.rot:
+            i, j = torch.randint(0, self.h_dim - 1, (2,))
+            if i != j and (i, j) not in pairs and (j, i) not in pairs:
+                pairs.append((i, j))
+        self.pairs.data.copy_(torch.tensor(pairs, dtype=torch.float32))
+
+    def reset_parameters(self):
+        nn.init.orthogonal_(self.matrix)
+        nn.init.zeros_(self.thetas)
+
     def q_rotation(self, x, theta, u, v):
-        x = x.to(self.device, self.dtype)
-
-        u = u.to(self.device)
-        v = v.to(self.device)
-        
-        u = u / torch.norm(u)
-        v = v / torch.norm(v)
-
-        half_theta = theta / 2
-        cos_ht = torch.cos(half_theta)
-        sin_ht = torch.sin(half_theta)
-
+        u = u / torch.linalg.matrix_norm(u, ord=2)
+        v = v / torch.linalg.matrix_norm(v, ord=2)
+        cos_ht = torch.cos(theta / 2)
+        sin_ht = torch.sin(theta / 2)
         q = torch.cat([cos_ht.unsqueeze(0), sin_ht * u])
         q_conj = torch.cat([cos_ht.unsqueeze(0), -sin_ht * u])  # noqa: F841
-
         x_shape = x.shape
         x = x.view(-1, 3)
-
         uv_cross = torch.cross(u.unsqueeze(0), x)
         uuv_cross = torch.cross(u.unsqueeze(0), uv_cross)
         x_rot = x + 2 * (q[0] * uv_cross + uuv_cross)
-
         x_rot = x_rot.view(*x_shape)
         return x_rot
 
@@ -228,7 +223,7 @@ class rotary(nn.Module):
             G = (G + Q) / 2
         return G
 
-    def rotate(self, x): # dparam = nn.Parameter(torch.zeros(1))
+    def rotations(self, x): # dparam = nn.Parameter(torch.zeros(1))
         direction = torch.sigmoid(self.dparam) * 2 - 1
         rotate = int(torch.round(self.rscale * self.rot))
         for k in range(rotate):
@@ -248,8 +243,7 @@ class rotary(nn.Module):
             self.dims = rest[0]
             if self.dims != self.head * self.head_dim:
                 raise ValueError(
-                    f"Needed {self.head * self.head_dim}, but got too many {self.dims}"
-                )
+                    f"Needed {self.head * self.head_dim}, but got too many {self.dims}")
         elif len(rest) == 2:
             self.head, self.head_dim = rest
             if self.head != self.head or self.head_dim != self.head_dim:
@@ -259,17 +253,17 @@ class rotary(nn.Module):
         else:
             raise ValueError(f"Expected the thingy to be 3D or 4D, but got {x.dim()}D")
         x = rearrange(x, 'b s (h d) -> (b s) h d', h=self.head)
-        x = self.rotate(x)
+        x = self.vectorize_rotations(x)
         x = x @ self.matrix
         x = rearrange(x, '(b s) h d -> b s (h d)', b=batch, h=self.head)
         
         position = torch.arange(end=self.ctx, device=device, dtype=dtype)
-        position = rearrange(tensor=position, pattern='s -> s 1')  # [seq_len, 1]
+        position = rearrange(tensor=position, pattern='s -> s 1')  # [ctx, 1]
         div_term = rearrange(tensor=self.invf, pattern='d -> 1 d')  # [1, dim/2]
-        sinusoid = position * div_term  # [seq_len, dim/2]
+        sinusoid = position * div_term  # [ctx, dim/2]
 
-        sin = rearrange(tensor=torch.sin(input=sinusoid), pattern='s d -> 1 s 1 d')  # [1, seq_len, 1, dim/2]
-        cos = rearrange(tensor=torch.cos(input=sinusoid), pattern='s d -> 1 s 1 d')  # [1, seq_len, 1, dim/2]
+        sin = rearrange(tensor=torch.sin(input=sinusoid), pattern='s d -> 1 s 1 d')  # [1, ctx, 1, dim/2]
+        cos = rearrange(tensor=torch.cos(input=sinusoid), pattern='s d -> 1 s 1 d')  # [1, ctx, 1, dim/2]
         
         x = rearrange(tensor=x, pattern='b s (h d) -> b s h d', h=self.head)
         x1, x2 = x[..., ::2], x[..., 1::2]
@@ -280,8 +274,6 @@ class rotary(nn.Module):
         x_out = x_out * math.sqrt(self.dims)
         return x_out
 
-
-
 def sinusoids(length, channels, max_timescale=10000):
     """Returns sinusoids for positional embedding"""
     assert channels % 2 == 0
@@ -291,7 +283,7 @@ def sinusoids(length, channels, max_timescale=10000):
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
 
-
+# %%
 
 class MultiheadA(nn.Module):
     use_sdpa = True
@@ -328,7 +320,8 @@ class MultiheadA(nn.Module):
 
         wv, qk = self.qkv_attention(q, k, v, mask)
         return self.out(wv), qk
-
+    
+    @autocast('cuda', enabled = True)
     def qkv_attention(
         self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -338,6 +331,7 @@ class MultiheadA(nn.Module):
         k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
 
+    
         if  MultiheadA.use_sdpa:
             a = scaled_dot_product_attention(
                 q, k, v, is_causal=mask is not None and ctx > 1
@@ -398,9 +392,9 @@ class KeyModule(nn.Module):
         nn.init.normal_(tensor=self.key.weight, std=0.02)
     
     def forward(self, x: Tensor) -> Tensor:
-        batch_size, seq_len = x.shape[:2]
+        batch, ctx = x.shape[:2]
         k = self.key(x)
-        k = k.view(batch_size, seq_len, self.head, self.head_dim).permute(0, 2, 1, 3)
+        k = k.view(batch, ctx, self.head, self.head_dim).permute(0, 2, 1, 3)
         k = k * self.scale
         return k
 
@@ -423,9 +417,9 @@ class ValueModule(nn.Module):
     
     def forward(self, x: Tensor) -> Tensor:
       
-        batch_size, seq_len = x.shape[:2]
+        batch, ctx = x.shape[:2]
         v = self.value(x)
-        v = v.view(batch_size, seq_len, self.head, self.head_dim).permute(0, 2, 1, 3)
+        v = v.view(batch, ctx, self.head, self.head_dim).permute(0, 2, 1, 3)
         return v
 
 class KeyValueModule(nn.Module):
@@ -441,11 +435,11 @@ class KeyValueModule(nn.Module):
         v = self.value_module(x)
         return k, v
 
+
 class AttentionCombiner(nn.Module):
     """Combines separate Q and KV representations for attention computation."""
     use_sdpa = True
     def __init__(self, dims: int, head: int):
-
         super().__init__()
         
         assert dims % head == 0, f"dims ({dims}) must be divisible by head ({head})"
@@ -453,42 +447,79 @@ class AttentionCombiner(nn.Module):
         self.dims = dims
         self.head = head
         self.head_dim = dims // head
-        self.use_sdpa = True
         
         self.out = Linear(in_features=dims, out_features=dims)
         nn.init.normal_(tensor=self.out.weight, std=0.02)
         nn.init.zeros_(tensor=self.out.bias)
-    
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None) -> Tensor:
 
-        batch_size = q.size(0)
-        seq_len = q.size(2)
-        
+    @autocast('cuda', enabled = True)
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        """
+        Args:
+            q, k, v: Tensors of shape [batch, head, ctx, head_dim] or [batch, ctx, dims]
+            mask: Optional mask tensor
+
+        """
+        if q.dim() == 3:
+            batch, ctx, _ = q.shape
+            q = q.view(batch, ctx, self.head, self.head_dim).permute(0, 2, 1, 3)
+            k = k.view(batch, k.size(1), self.head, self.head_dim).permute(0, 2, 1, 3)
+            v = v.view(batch, v.size(1), self.head, self.head_dim).permute(0, 2, 1, 3)
+        else:
+            batch = q.size(0)
+            ctx = q.size(2)
+
         if AttentionCombiner.use_sdpa:
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v, 
-                attn_mask=mask, 
-                is_causal=(mask is not None and seq_len > 1)
-            )
+            try:
+                attn_output = scaled_dot_product_attention(
+                    q, k, v, is_causal=mask is not None and ctx > 1
+                )
+            except RuntimeError:
+                print(f"SDPA failed with shapes: q={q.shape}, k={k.shape}, v={v.shape}")
+                attn = torch.matmul(q, k.transpose(-1, -2))
+                if mask is not None:
+                    if mask.dim() <= 2:
+                        mask_to_use = mask[:ctx, :k.size(2)]
+                        attn = attn + mask_to_use
+                    else:
+                        pass
+                attn = F.softmax(attn, dim=-1)
+                attn_output = torch.matmul(attn, v)
         else:
             attn = torch.matmul(q, k.transpose(-1, -2))
+            
             if mask is not None:
-                attn = attn + mask[:seq_len, :seq_len]
+                if mask.dim() == 2:
+                    mask_len = min(mask.size(0), ctx)
+                    mask_to_apply = mask[:mask_len, :mask_len]
+                    attn[:, :, :mask_len, :mask_len] = attn[:, :, :mask_len, :mask_len] + mask_to_apply
+                elif mask.dim() == 3:
+                    mask_len = min(mask.size(1), ctx)
+                    mask_to_apply = mask[:, :mask_len, :mask_len]
+                    attn[:, :, :mask_len, :mask_len] = attn[:, :, :mask_len, :mask_len] + mask_to_apply.unsqueeze(1)
+                elif mask.dim() == 4:
+                    mask_q_len = min(mask.size(2), ctx)
+                    mask_k_len = min(mask.size(3), k.size(2))
+                    attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len] + mask[:, :, :mask_q_len, :mask_k_len]
                 
             attn = F.softmax(attn, dim=-1)
             attn_output = torch.matmul(attn, v)
         
-        output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.dims)
+        output = attn_output.permute(0, 2, 1, 3).reshape(batch, ctx, self.dims)
         return self.out(output)
+
 
 class AdaptiveUpdateAttention(nn.Module):
     """Attention implementation with content-dependent update frequencies."""
-    def __init__(self, dims: int, head: int):
+    def __init__(self, dims: int, head: int, max_dist=256):
         super().__init__()
         self.query_module = QueryModule(dims, head)
         self.key_module = KeyModule(dims, head)
         self.value_module = ValueModule(dims, head)
         self.combiner = AttentionCombiner(dims, head)
+        self.max_dist = max_dist
+        self.head = head
+        self.dims = dims
 
         self.key_update_predictor = nn.Sequential(
             Linear(dims, dims // 4), nn.ReLU(), Linear(dims // 4, 1), nn.Sigmoid()
@@ -499,6 +530,8 @@ class AdaptiveUpdateAttention(nn.Module):
         )
 
         self.update_threshold = 0.5
+        self.stored_key_cache = None
+        self.stored_value_cache = None
 
     def should_update_key(self, x: torch.Tensor) -> torch.Tensor:
         """Predict whether the key should be updated based on content."""
@@ -510,56 +543,52 @@ class AdaptiveUpdateAttention(nn.Module):
         avg_rep = x.mean(dim=1)
         return self.value_update_predictor(avg_rep) > self.update_threshold
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        xa: Optional[torch.Tensor] = None,
-        key_cache: Optional[torch.Tensor] = None,
-        value_cache: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-
+    def forward(self, x, xa=None, mask=None, kv_cache=None):
+        """Modified forward method to match FocusA's interface"""
+        batch, ctx, _ = x.shape
+        
         q = self.query_module(x)
-
+        
         kv_input = xa if xa is not None else x
-
-        batch_size = kv_input.shape[0]
         device = kv_input.device
 
-        if key_cache is None:
-            update_k = torch.ones(batch_size, dtype=torch.bool, device=device)
+        if kv_cache is None:
             k = self.key_module(kv_input)
+            v = self.value_module(kv_input)
+            
+            self.stored_key_cache = k
+            self.stored_value_cache = v
         else:
             update_k = self.should_update_key(kv_input)
+            update_v = self.should_update_value(kv_input)
+            
             if update_k.any():
                 new_k = self.key_module(kv_input)
-                update_mask = update_k.view(-1, 1, 1, 1).expand_as(key_cache)
-                k = torch.where(update_mask, new_k, key_cache)
+                if self.stored_key_cache is not None:
+                    update_mask = update_k.view(-1, 1, 1, 1).expand_as(self.stored_key_cache)
+                    k = torch.where(update_mask, new_k, self.stored_key_cache)
+                else:
+                    k = new_k
             else:
-                k = key_cache
-
-        if value_cache is None:
-            update_v = torch.ones(batch_size, dtype=torch.bool, device=device)
-            v = self.value_module(kv_input)
-        else:
-            update_v = self.should_update_value(kv_input)
+                k = self.stored_key_cache if self.stored_key_cache is not None else self.key_module(kv_input)
+            
             if update_v.any():
                 new_v = self.value_module(kv_input)
-                update_mask = update_v.view(-1, 1, 1, 1).expand_as(value_cache)
-                v = torch.where(update_mask, new_v, value_cache)
+                if self.stored_value_cache is not None:
+                    update_mask = update_v.view(-1, 1, 1, 1).expand_as(self.stored_value_cache)
+                    v = torch.where(update_mask, new_v, self.stored_value_cache)
+                else:
+                    v = new_v
             else:
-                v = value_cache
-
-        output = self.combiner(q, k, v)
-
-        cache_updates = {
-            "key_cache": k,
-            "value_cache": v,
-            "key_updated": update_k,
-            "value_updated": update_v,
-        }
-
-        return output, cache_updates
-
+                v = self.stored_value_cache if self.stored_value_cache is not None else self.value_module(kv_input)
+            
+            self.stored_key_cache = k
+            self.stored_value_cache = v
+        
+        output = self.combiner(q, k, v, mask=mask)
+        
+        return output
+    
 class Refiner:
     def __init__(self, states, actions, alpha=0.1, gamma=0.9, epsilon=0.1):
         self.states = states
@@ -596,7 +625,7 @@ class Refiner:
 class Predictor(nn.Module):
     def __init__(self, dims):
         super().__init__()
-        self.linear = nn.Linear(in_features=dims, out_features=1)
+        self.linear = Linear(in_features=dims, out_features=1)
         nn.init.xavier_normal_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
 
@@ -620,6 +649,7 @@ class AdaptiveSpan(nn.Module):
         self.head_dim = dims // head
         self.register_buffer("scale", torch.tensor(self.head_dim**-0.25))
 
+    @autocast('cuda', enabled = True)
     def forward(self, query, key, value, max_dist=None, max_span=None, span_scale=None):
         if max_dist is None:
             max_dist = self.max_dist
@@ -633,16 +663,16 @@ class AdaptiveSpan(nn.Module):
         eff_span = min(span_len, max_dist)
         
         if eff_span == 0:
-            batch_size = query.shape[0]
-            return (torch.zeros(batch_size, eff_span, self.dims, device=query.device), None)
+            batch = query.shape[0]
+            return (torch.zeros(batch, eff_span, self.dims, device=query.device), None)
             
         q_span = query[:, :eff_span, :]
         k_span = key[:, :eff_span, :]
         v_span = value[:, :eff_span, :]
 
-        batch_size = q_span.shape[0]
+        batch = q_span.shape[0]
 
-        reshape_dims = (batch_size, -1, self.head, self.head_dim)
+        reshape_dims = (batch, -1, self.head, self.head_dim)
         q = q_span.view(*reshape_dims).permute(0, 2, 1, 3)
         k = k_span.view(*reshape_dims).permute(0, 2, 1, 3)
         v = v_span.view(*reshape_dims).permute(0, 2, 1, 3)
@@ -656,12 +686,12 @@ class AdaptiveSpan(nn.Module):
             scores = torch.matmul(q, k.transpose(-2, -1))
             weights = torch.softmax((scores / temperature) * self.scale, dim=-1)
             out = torch.matmul(weights, v)
-            out = out.permute(0, 2, 1, 3).reshape(batch_size, eff_span, self.dims)
+            out = out.permute(0, 2, 1, 3).reshape(batch, eff_span, self.dims)
 
         return out, weights
 
-class FocusA(nn.Module):
-    def __init__(self, dims, head, max_dist, sharpen=True, win_size=256, max_span=512):
+class IntegratedAttention(nn.Module):
+    def __init__(self, ctx, dims, head, max_dist=512, win_size=256, max_span=384, temp_scale=0.01,):
         super().__init__()
         self.head = head
         self.max_dist = max_dist
@@ -669,9 +699,9 @@ class FocusA(nn.Module):
         self.max_span = max_span
         self.sliding_window = win_size
         self.temp_scale = 0.01
-        self.sharpen = sharpen
+        self.sharpen = True
         self.head_dim = dims // head
-        self.batch_size = None
+        self.batch = None
 
         self.refiner = Refiner(
             states=10000, actions=10, alpha=0.1, gamma=0.9, epsilon=0.1
@@ -680,12 +710,12 @@ class FocusA(nn.Module):
         self.attn_local = AdaptiveSpan(
             dims=dims, head=head, max_dist=max_dist, sharpen=True, temp_scale=0.01
         )
-        self.attn_global = MultiheadA(dims=dims, head=head, max_dist=max_dist)
 
-        self.projection = nn.Linear(in_features=2 * dims, out_features=dims)
+        self.attn_global = AdaptiveUpdateAttention(dims=dims, head=head, max_dist=max_dist)
+        self.projection = Linear(in_features=2 * dims, out_features=dims)
 
-        self.ln_a = nn.LayerNorm(normalized_shape=dims)
-        self.ln_b = nn.LayerNorm(normalized_shape=dims)
+        self.ln_a = LayerNorm(normalized_shape=dims)
+        self.ln_b = LayerNorm(normalized_shape=dims)
 
         mask = torch.empty(max_span, max_span).fill_(float("-inf")).triu_(diagonal=1)
         self.register_buffer("mask", mask, persistent=False)
@@ -701,14 +731,14 @@ class FocusA(nn.Module):
         local = self.ln_a(x)
         globe = self.ln_b(x)
 
-        globe_out, _ = self.attn_global(globe, globe, globe)
-        base_scale = self.span_pred(globe_out)
+        globe_out = self.attn_global(globe, globe, globe)
+        freq_scale = self.span_pred(globe_out)
         state = self.extract(local)
 
         action = self.refiner.choose_action(state=state)
         refine = self.action_scale(action=action)
 
-        span_scale = torch.clamp(base_scale * refine, min=0.0, max=1.0)
+        span_scale = torch.clamp(freq_scale * refine, min=0.0, max=1.0)
         span_mean = span_scale.mean().item()
 
         with torch.no_grad():
@@ -766,7 +796,8 @@ class FocusA(nn.Module):
         dtype = next(self.parameters()).dtype
         span_scale = torch.tensor([span_value], device=device, dtype=dtype)
         return span_scale
-
+    
+    @autocast('cuda', enabled = True)
     def _focus(self, query, key, value, span_scale, mask):
         max_iterations = 10
         iteration = 0
@@ -789,13 +820,13 @@ class FocusA(nn.Module):
             k_span = key[:, :eff_span, :]
             v_span = value[:, :eff_span, :]
 
-            batch_size, seq_len, dims = q_span.size()
+            batch, ctx, dims = q_span.size()
             d_k = dims // self.head
             scale_factor = 1 / math.sqrt(d_k)
 
-            q = q_span.view(batch_size, seq_len, self.head, -1).transpose(1, 2)
-            k = k_span.view(batch_size, seq_len, self.head, -1).transpose(1, 2)
-            v = v_span.view(batch_size, seq_len, self.head, -1).transpose(1, 2)
+            q = q_span.view(batch, ctx, self.head, -1).transpose(1, 2)
+            k = k_span.view(batch, ctx, self.head, -1).transpose(1, 2)
+            v = v_span.view(batch, ctx, self.head, -1).transpose(1, 2)
 
             if self.sharpen:
                 temperature = 1.0 + self.temp_scale * (1.0 - span_scale.mean().item())
@@ -812,7 +843,7 @@ class FocusA(nn.Module):
                 mask_k_len = min(mask.size(-1), attn_scores.size(-1))
                 resized_mask = torch.ones(
                     (
-                        batch_size,
+                        batch,
                         self.head,
                         attn_scores.size(-2),
                         attn_scores.size(-1),
@@ -829,7 +860,7 @@ class FocusA(nn.Module):
             attn_weights = torch.softmax(attn_scores, dim=-1)
             attn_out = torch.matmul(attn_weights, v)
             attn_out = (
-                attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+                attn_out.transpose(1, 2).contiguous().view(batch, ctx, -1)
             )
 
             diff = torch.abs(attn_out - prev_attn).mean()
@@ -842,22 +873,23 @@ class FocusA(nn.Module):
             query = query + attn_out
             iteration += 1
         return attn_out, attn_weights
-
+    
+    @autocast('cuda', enabled = True)
     def slide_win(self, x, win_size, span_len, span_scale, mask):
-        batch_size, seq_len, dims = x.size()
-        self.batch_size = batch_size
-        num_windows = (seq_len + win_size - 1) // win_size
+        batch, ctx, dims = x.size()
+        self.batch = batch
+        num_windows = (ctx + win_size - 1) // win_size
         output = torch.zeros_like(x)
         device = x.device
         default_mask = None
 
         for i in range(num_windows):
             start_idx = i * win_size
-            end_idx = min((i + 1) * win_size, seq_len)
+            end_idx = min((i + 1) * win_size, ctx)
             window_size = end_idx - start_idx
 
             key_start = max(0, start_idx - span_len + win_size)
-            key_end = min(start_idx + span_len, seq_len)
+            key_end = min(start_idx + span_len, ctx)
             span_size = key_end - key_start
 
             query = x[:, start_idx:end_idx, :]
@@ -876,7 +908,7 @@ class FocusA(nn.Module):
                         or default_mask.size(-1) != span_size
                     ):
                         default_mask = torch.ones(
-                            (batch_size, self.head, window_size, span_size),
+                            (batch, self.head, window_size, span_size),
                             device=device,
                             dtype=torch.bool,
                         )
@@ -888,7 +920,7 @@ class FocusA(nn.Module):
                     or default_mask.size(-1) != span_size
                 ):
                     default_mask = torch.ones(
-                        (batch_size, self.head, window_size, span_size),
+                        (batch, self.head, window_size, span_size),
                         device=device,
                         dtype=torch.bool,
                     )
@@ -906,248 +938,8 @@ class FocusA(nn.Module):
 
         return output
     
-class IntegratedAttention(nn.Module):
-    def __init__(self, dims, head, max_dist, win_size, max_span, temp_scale=0.01, 
-                 update_threshold=0.4, s_factor=0.1, global_attention_ratio=0.2):
-        super().__init__()
 
-        self.head = head
-        self.max_dist = max_dist
-        self.dims = dims
-        self.max_span = max_span
-        self.sliding_window = win_size
-        self.temp_scale = temp_scale
-        self.sharpen = True
-        self.head_dim = dims // head
-        self.bat = None
-        self.all_weights = []
-        self.global_attention_ratio = global_attention_ratio
-
-        self.refiner = Refiner(states=10000, actions=10, alpha=0.1, gamma=0.9, epsilon=0.1)
-        self.span_pred = Predictor(dims=dims)
-        self.alocal = AdaptiveSpan(
-            dims=dims, head=head, max_dist=max_dist, sharpen=True, temp_scale=temp_scale
-        )
-
-        self.out = nn.Linear(in_features=2 * dims, out_features=dims)
-
-        self.lna = nn.LayerNorm(normalized_shape=dims)
-        self.lnb = nn.LayerNorm(normalized_shape=dims)
-
-        mask = torch.empty(max_span, max_span).fill_(float("-inf")).triu_(diagonal=1)
-        self.register_buffer("mask", mask, persistent=False)
-
-        self.register_buffer("window_mask", None, persistent=False)
-        self.register_buffer("threshold", torch.tensor(1e-4), persistent=False)
-        self.s_factor = s_factor
-        self.key_update_predictor = nn.Sequential(
-            Linear(dims, dims // 4), nn.ReLU(), Linear(dims // 4, 1), nn.Sigmoid()
-        )
-
-        self.value_update_predictor = nn.Sequential(
-            Linear(dims, dims // 4), nn.ReLU(), Linear(dims // 4, 1), nn.Sigmoid()
-        )
-        self.update_threshold = update_threshold
-
-        self.query_module = QueryModule(dims, head)
-        self.key_module = KeyModule(dims, head)
-        self.value_module = ValueModule(dims, head)
-        self.combiner = AttentionCombiner(dims, head)
-
-    def should_update_key(self, x: torch.Tensor) -> torch.Tensor:
-        """Predict whether the key should be updated based on content."""
-        avg_rep = x.mean(dim=1)
-        return self.key_update_predictor(avg_rep) > self.update_threshold
-
-    def should_update_value(self, x: torch.Tensor) -> torch.Tensor:
-        """Predict whether the value should be updated based on content."""
-        avg_rep = x.mean(dim=1)
-        return self.value_update_predictor(avg_rep) > self.update_threshold
-
-    def forward(self, x, xa=None, mask=None, kv_cache=None, key_cache=None, value_cache=None):
-        if mask is None:
-            mask = self.mask
-
-        local = self.lna(x)
-        globe = self.lnb(x)
-
-        freq_scale = self.span_pred(globe)
-        state = self.extract(local)
-
-        action = self.refiner.choose_action(state=state)
-        refine = self.action_scale(action=action)
-
-        span_scale = torch.clamp(freq_scale * refine, min=0.0, max=1.0)
-        span_mean = span_scale.mean().item()
-
-        with torch.no_grad():
-            current_win_size = max(1, int(self.sliding_window * span_mean))
-            current_span_len = max(1, int(self.max_span * span_mean))
-
-            effective_max = min(self.max_dist, local.size(1))
-            local_max = min(self.max_dist, current_span_len, current_win_size)
-            globe_max = effective_max
-
-        self.alocal.max_dist = local_max
-        local_out = self.slide_win( 
-            x=local,
-            win_size=current_win_size,
-            span_len=current_span_len,
-            span_scale=span_scale,
-            mask=mask,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            is_global=False
-        )
-        with torch.no_grad():
-            quality = self.quality(output=local_out)
-            next_state = self.extract(local_out)
-            self.refiner.update(
-                state=state, action=action, reward=quality, next_state=next_state
-            )
-
-        global_out = self.slide_win(
-            x=globe,
-            win_size=globe.size(1),
-            span_len=globe_max,
-            span_scale=torch.ones_like(span_scale),
-            mask=mask,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            is_global=True
-        )
-        
-        combined = torch.cat([local_out, global_out], dim=-1)
-        x = self.projection(combined)
-
-        return x
-
-    def quality(self, output):
-        with torch.no_grad():
-            safe_output = output.clamp(min=1e-10)
-            entropy = -(safe_output * torch.log(safe_output)).sum(-1).mean()
-            coverage = (output > 0.01).float().mean()
-            return float(coverage - 0.1 * entropy)
-
-    def extract(self, x):
-        with torch.no_grad():
-            mean_state = x.mean(dim=(0, 1))
-            var_state = x.var(dim=(0, 1), unbiased=False)
-            state = torch.cat([mean_state, var_state])
-            state_id = self.discretize(state.cpu().numpy())
-        return state_id
-
-    def discretize(self, state):
-        bins = np.linspace(-1, 1, num=10)
-        state_discrete = np.digitize(state, bins)
-        state_hash = hash(tuple(state_discrete))
-        state_id = state_hash % (self.refiner.states - 1)
-        return state_id
-
-    def action_scale(self, action):
-        span_value = action / (self.refiner.actions - 1)
-        device = next(self.parameters()).device
-        dtype = next(self.parameters()).dtype
-        span_scale = torch.tensor([span_value], device=device, dtype=dtype)
-        return span_scale
-
-    def slide_win( self, x, win_size, span_len, span_scale, mask, key_cache, value_cache, is_global, ):
-        bat, ctx, dims = x.size()
-        self.bat = bat
-        num_windows = (ctx + win_size - 1) // win_size
-        output = torch.zeros_like(x)
-        device = x.device
-        default_mask = None
-        
-
-        for i in range(num_windows):
-            start_idx = i * win_size
-            end_idx = min((i + 1) * win_size, ctx)
-            window_size = end_idx - start_idx
-            # print("window_size", win_size)
-
-            key_start = max(0, start_idx - span_len + win_size)
-            key_end = min(start_idx + span_len, ctx)
-            span_size = key_end - key_start
-            
-            query_win = x[:, start_idx:end_idx, :]
-            key_win = x[:, key_start:key_end, :]
-            value_win = key_win
-            if mask is not None:
-                if mask.dim() == 4:
-                    window_mask = mask[:, :, start_idx:end_idx, key_start:key_end]
-                    if window_mask.size(1) == 1:
-                        window_mask = window_mask.expand(-1, self.head, -1, -1)
-                else:
-                    if (
-                        default_mask is None
-                        or default_mask.size(-2) != window_size
-                        or default_mask.size(-1) != span_size
-                    ):
-                        default_mask = torch.ones(
-                            (bat, self.head, window_size, span_size),
-                            device=device,
-                            dtype=torch.bool,
-                        )
-                    window_mask = default_mask
-            else:
-                if (
-                    default_mask is None
-                    or default_mask.size(-2) != window_size
-                    or default_mask.size(-1) != span_size
-                ):
-                    default_mask = torch.ones(
-                        (bat, self.head, window_size, span_size),
-                        device=device,
-                        dtype=torch.bool,
-                    )
-                window_mask = default_mask
-
-            q = self.query_module(query_win)
-
-            if key_cache is None or "key_cache" not in key_cache or is_global:
-                update_k = torch.ones(bat, dtype=torch.bool, device=device)
-                k = self.key_module(key_win)
-            else:
-                update_k = self.should_update_key(key_win)
-                if update_k.any():
-                    new_k = self.key_module(key_win)
-                    update_mask = update_k.view(-1, 1, 1, 1).expand_as(
-                        key_cache["key_cache"]
-                    )
-                    k = torch.where(update_mask, new_k, key_cache["key_cache"])
-                else:
-                    k = key_cache["key_cache"]
-
-            if value_cache is None or "value_cache" not in value_cache or is_global:
-                update_v = torch.ones(bat, dtype=torch.bool, device=device)
-                v = self.value_module(value_win)
-            else:
-                update_v = self.should_update_value(value_win)
-                if update_v.any():
-                    new_v = self.value_module(value_win)
-                    update_mask = update_v.view(-1, 1, 1, 1).expand_as(
-                        value_cache["value_cache"]
-                    )
-                    v = torch.where(update_mask, new_v, value_cache["value_cache"])
-                else:
-                    v = value_cache["value_cache"]
-
-            attn_out = self.combiner(q, k, v, mask=window_mask)
-            output[:, start_idx:end_idx, :] = attn_out
-            
-
-            if key_cache is not None and not is_global:
-                key_cache["key_cache"] = k
-                key_cache["value_cache"] = v
-
-        return output
-
-    def projection(self, x):
-        return self.out(x)
-
-
-
+# %%
 class Residual(nn.Module):
     def __init__(self, dims: int, head: int, dropout: float, act: str, debug=False, cross_attention=False):
         if debug is True:
@@ -1201,8 +993,8 @@ class Residual(nn.Module):
     
 class AudioEncoder(nn.Module):
     def __init__( self, mels: int, ctx: int, dims: int, head: int, layerA: int, layerB: int, checkpoint: bool, dropout: float, act: str,  
-                 scale_embedding=1.0, debug=False):
-        if debug is True:
+                 scale_embedding, debug=None):
+        if debug == 1:
             print(
                 f"AudioEncoder check: {mels} {ctx} {dims} {head} {checkpoint} {dropout} {act} {layerA} {layerB}"
             )
@@ -1235,9 +1027,9 @@ class AudioEncoder(nn.Module):
         self.blockA = ( nn.ModuleList( modules=[ Residual(dims=dims, head=head, dropout=dropout, act=act, debug=debug) 
                                                 for _ in range(layerA) ] ) if layerA > 0 else None )
 
-        self.blockB = ( nn.ModuleList( modules=[ IntegratedAttention(dims=dims, head=head, max_dist=ctx, win_size=ctx, max_span=ctx)
+        self.blockB = ( nn.ModuleList( modules=[ IntegratedAttention(ctx=ctx, dims=dims, head=head)
                                                 for _ in range(layerB) ] ) if layerB > 0 else None )
-        self.ln_post = LayerNorm(dims)
+        self.ln_enc = LayerNorm(dims)
 
     def forward(self, x: Tensor):
         x = F.gelu(self.conv1(x))
@@ -1260,15 +1052,15 @@ class AudioEncoder(nn.Module):
                     x = result[0]
                 else:
                     x = result
-        x = self.ln_post(x)
+        x = self.ln_enc(x)
         return x
     
     def _forward(self, x: Tensor):
         return x
 
 class TextDecoder(nn.Module):
-    def __init__( self, vocab: int, ctx: int, dims: int, head: int, layerA: int, layerB: int, checkpoint: bool, dropout: float, act: str,  debug=False):
-        if debug is True: print( f"TextDecoder check: {vocab} {ctx} {dims} {head} {checkpoint} {dropout} {act} {layerA} {layerB}" )  # noqa: E701
+    def __init__( self, vocab: int, ctx: int, dims: int, head: int, layerA: int, layerB: int, checkpoint: bool, dropout: float, act: str,  debug=None):
+        if debug == 2: print( f"TextDecoder check: {vocab} {ctx} {dims} {head} {checkpoint} {dropout} {act} {layerA} {layerB}" )  # noqa: E701
         super().__init__() 
         self.checkpoint = checkpoint 
         self.dims = dims 
@@ -1284,11 +1076,12 @@ class TextDecoder(nn.Module):
         self.positional_embedding = nn.Parameter(data=torch.empty(ctx, dims)) 
         nn.init.normal_(tensor=self.positional_embedding, mean=0.0, std=0.02) 
 
-        self.lna = LayerNorm(normalized_shape=dims) 
+        self.ln_dec = LayerNorm(normalized_shape=dims) 
         
         self.blockA = ( nn.ModuleList( modules=[ Residual(dims=dims, head=head, dropout=dropout, act=act ) 
                                                 for _ in range(layerA) ] ) if layerA > 0 else None ) 
-        self.blockB = ( nn.ModuleList( modules=[ IntegratedAttention(dims=dims, head=head, max_dist=ctx, win_size=ctx, max_span=ctx)
+        
+        self.blockB = ( nn.ModuleList( modules=[ IntegratedAttention(ctx=ctx, dims=dims, head=head)
                                                 for _ in range(layerB) ] ) if layerB > 0 else None )
         
         mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
@@ -1306,16 +1099,18 @@ class TextDecoder(nn.Module):
         for block in chain(self.blockA or [], self.blockB or []):
             x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
 
-        x = self.lna(x)
+        x = self.ln_dec(x)
         logits = (
             x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)
         ).float()
         return logits
 
 class Echo(nn.Module):
-    def __init__(self, param: Dimensions, attention=False):
+    def __init__(self, param: Dimensions, debug=None):
         super().__init__()
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.debug = debug
         self.param = param
         self.to(device)
 
@@ -1398,7 +1193,17 @@ class Echo(nn.Module):
         return self.decoder(input_ids, audio_features)
 
     def forward(self, mel: torch.Tensor, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return self.decoder(tokens, self.encoder(mel))
+        loss = None
+        if self.training:
+            audio_features = self.encoder(mel)
+            logits = self.decoder(tokens, audio_features)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), tokens.view(-1))
+            self.update_freq(loss=loss.item())
+        else:
+            audio_features = self.encoder(mel)
+            logits = self.decoder(tokens, audio_features)
+        return {"loss": loss, "logits": logits}
+
     
     @property
     def is_multilingual(self):
@@ -1414,7 +1219,7 @@ class Echo(nn.Module):
 
         def save_to_cache(module, _, output):
             if module not in cache or output.shape[1] > self.param.text_ctx:
-                # save as-is, for the first token or cross attention
+    
                 cache[module] = output
             else:
                 cache[module] = torch.cat([cache[module], output], dim=1).detach()
@@ -1450,8 +1255,30 @@ class Echo(nn.Module):
         self.decoder.apply(install_hooks)
         
         return cache, hooks
+    
+    def adjust_freq(self, loss, factor=1.0025) -> float | int:
+            if self.adjust_counter % 25 == 0:
+                if loss < self.best_loss:
+                    new_freq=self.freq*factor
+                else:
+                    new_freq=self.freq/factor
+                self.update_freq(new_freq=new_freq)
+                self.freq=new_freq
+                self.best_loss=loss
+            self.adjust_counter += 1
+            return self.freq
+            
+    def update_freq(self, new_freq):
+        self.new_freq=new_freq
+        for name, module in self.encoder.named_modules():
+            if isinstance(module, (rotary)):
+                module.update_freq(new_freq=self.new_freq)
 
+    def generate(self, mel: torch.Tensor, max_length: int = 512) -> torch.Tensor:
+        audio_features = self.encoder(mel)
+        return self.decoder.generate(audio_features, max_length=max_length)
 
+# %%
 
 def ctx_to_samples(audio_ctx, hop_length):
     samples_token = hop_length * 2
@@ -1496,23 +1323,37 @@ def pad(array, target_length, axis=-1, dtype: torch.dtype = torch.float32):
         )
     return array
 
+def exact_div(x, y):
+    assert x % y == 0
+    return x // y
+
 def process_audio(audio, audio_ctx, mels, hop_length, n_fft, sr):
+
     audio = load_wave(wave_data=audio, sample_rate=sr)
-    target_length = ctx_to_samples(audio_ctx=audio_ctx, hop_length=hop_length)
-    audio = pad(array=audio, target_length=target_length)
+    n_samples = ctx_to_samples(audio_ctx=audio_ctx, hop_length=hop_length)
+    audio = pad(array=audio, target_length=n_samples)
+
     transform = T.MelSpectrogram(
         sample_rate=sr,
         n_fft=n_fft,
         hop_length=hop_length,
         n_mels=mels,
-        normalized=False,
-        center=True,
+        norm='slaney',
+        normalized=True,
+        power=2.0,
+        center=True, 
+        window_fn=torch.hann_window,
     )
+    
     mel_spectrogram = transform(audio)
-    mel_spectrogram = mel_spectrogram[:, :3000]
-    epsilon = 1e-10
-    log_mel = torch.log(mel_spectrogram + epsilon)
-    log_mel = (log_mel - log_mel.mean(dim=-1, keepdim=True)) / (log_mel.std(dim=-1, keepdim=True) + 1e-10)
+
+    target_frames = exact_div(n_samples, hop_length) 
+    mel_spectrogram = pad(array=mel_spectrogram, target_length=target_frames, axis=-1)
+
+    log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
+    log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
+    log_mel = (log_mel + 4.0) / 4.0
+    
     return log_mel
 
 tokenizer = WhisperTokenizer.from_pretrained(
@@ -1520,7 +1361,7 @@ tokenizer = WhisperTokenizer.from_pretrained(
 )
 
 class DataCollator:
-    def __init__(self, tokenizer, audio_ctx=1500, text_ctx=448, mels=128, n_fft=400, hop_length=160, sample_rate=16000, device="cpu"):
+    def __init__(self, tokenizer, audio_ctx, text_ctx, mels, n_fft=1024, hop_length=160, sample_rate=16000, device="cpu"):
         self.tokenizer = tokenizer
         self.text_ctx = text_ctx
         self.audio_ctx = audio_ctx
@@ -1529,7 +1370,7 @@ class DataCollator:
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.device = device
-        self.decoder_start_token_id = tokenizer.bos_token_id + 1
+        self.decoder_start_token_id = tokenizer.bos_token_id 
         self.pad_token_id = tokenizer.pad_token_id
 
     def __call__(self, features):
@@ -1604,65 +1445,70 @@ def compute_metrics(pred, tokenizer):
     wer = 100 * metric.compute(predictions=pred_str, references=label_str) # type: ignore
     return {"wer": wer}
 
-def traiand_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn,
-                      max_steps=10000, device='cuda', accumulation_steps=1, clear_cache=True,
-                      log_interval=10, eval_interval=100, save_interval=1000,
-                      checkpoint_dir="checkpoint_dir", log_dir="log_dir"):
+
+# %%
+
+
+def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn,
+                        max_steps=10000, device='cuda', accumulation_steps=1, clear_cache=True,
+                        log_interval=10, eval_interval=100, save_interval=1000,
+                        checkpoint_dir="checkpoint_dir", log_dir="log_dir"):
     model.to(device)
     global_step = 0
-    scaler = torch.GradScaler(device='cuda')
+    scaler = torch.GradScaler()
     writer = SummaryWriter(log_dir=log_dir)
     train_iterator = iter(train_loader)
     total_loss = 0
     step_in_report = 0
     dataset_epochs = 0
-    
-    progress_bar = tqdm(total=max_steps, desc="Training")
-    
+
+    progress_bar = tqdm(total=max_steps, desc="Training Progress", leave=True, colour='green')
+
     model.train()
     optimizer.zero_grad()
-    
+
     while global_step < max_steps:
         try:
             batch = next(train_iterator)
         except StopIteration:
             train_iterator = iter(train_loader)
             batch = next(train_iterator)
-            
             dataset_epochs += 1
             print(f"Starting dataset epoch {dataset_epochs}")
-            
+
             if step_in_report > 0:
-                avg_loss = total_loss / step_in_report if step_in_report > 0 else 0
+                avg_loss = total_loss / step_in_report
                 logging.info(f"Dataset iteration complete - Steps: {global_step}, Avg Loss: {avg_loss:.4f}")
                 total_loss = 0
                 step_in_report = 0
-        
+
         start_time = time.time()
 
         input_features = batch['input_features'].to(device)
         input_ids = batch['input_ids'].to(device)
         labels = batch['labels'].long().to(device)
 
-        input_features_encoded = model.encoder(input_features)
-        decoder_output = model.decoder(input_ids, input_features_encoded)
-        logits = decoder_output.view(-1, decoder_output.size(-1))
-        active_logits = logits.view(-1, decoder_output.size(-1))
-        active_labels = labels.view(-1)
-        active_mask = active_labels != -100
-        active_logits = active_logits[active_mask]
-        active_labels = active_labels[active_mask]
-        loss = loss_fn(active_logits, active_labels)
-        
+        with torch.autocast(device_type="cuda"):
+            input_features_encoded = model.encoder(input_features)
+            decoder_output = model.decoder(input_ids, input_features_encoded)
+            logits = decoder_output.view(-1, decoder_output.size(-1))
+            active_logits = logits.view(-1, decoder_output.size(-1))
+            active_labels = labels.view(-1)
+            active_mask = active_labels != -100
+            active_logits = active_logits[active_mask]
+            active_labels = active_labels[active_mask]
+            loss = loss_fn(active_logits, active_labels)
+            # model.adjust_freq(loss=loss.item())
         total_loss += loss.item()
         loss = loss / accumulation_steps
+        
 
         scaler.scale(loss).backward()
 
         if (global_step + 1) % accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer=optimizer)
+            scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
 
@@ -1674,8 +1520,7 @@ def traiand_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, sch
 
         if global_step % log_interval == 0:
             writer.add_scalar(tag='Loss/train', scalar_value=total_loss / (global_step + 1), global_step=global_step)
-            
-            lr = optimizer.param_groups[0].get('lr', None)
+            lr = scheduler.get_last_lr()[0]
             writer.add_scalar(tag='LearningRate', scalar_value=lr, global_step=global_step)
             writer.add_scalar(tag='SamplesPerSec', scalar_value=samples_per_sec, global_step=global_step)
 
@@ -1687,16 +1532,17 @@ def traiand_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, sch
             all_labels = []
             batch_count = 0
             total_samples = 0
-            
+
             with torch.no_grad():
-                for eval_batch in tqdm(eval_loader, desc=f"Evaluating (Step {global_step})", leave=False):
+                for eval_batch in eval_loader:
+                # for eval_batch in tqdm(eval_loader, desc=f"Evaluating (Step {global_step})", leave=True, colour='green'):
                     input_features = eval_batch['input_features'].to(device)
-                    input_ids = eval_batch['input_ids'].to(device) 
+                    input_ids = eval_batch['input_ids'].to(device)
                     labels = eval_batch['labels'].long().to(device)
-                    
-                    batch_size = input_features.size(0)
-                    total_samples += batch_size
-                    
+
+                    batch = input_features.size(0)
+                    total_samples += batch
+
                     input_features_encoded = model.encoder(input_features)
                     decoder_output = model.decoder(input_ids, input_features_encoded)
                     logits = decoder_output.view(-1, decoder_output.size(-1))
@@ -1707,56 +1553,43 @@ def traiand_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, sch
                     batch_count += 1
 
             eval_time = time.time() - eval_start_time
-            eval_loss_avg = eval_loss / batch_count if batch_count > 0 else 0
+            loss_avg = eval_loss / batch_count if batch_count > 0 else 0
             predictions = {"predictions": np.array(all_predictions, dtype=object), "label_ids": np.array(all_labels, dtype=object)}
             metrics = compute_metrics(pred=predictions, tokenizer=tokenizer)
-            
-            writer.add_scalar('Loss/eval', eval_loss_avg, global_step)
+
+            writer.add_scalar('Loss/eval', loss_avg, global_step)
             writer.add_scalar('WER', metrics['wer'], global_step)
             writer.add_scalar('EvalSamples', total_samples, global_step)
             writer.add_scalar('EvalTimeSeconds', eval_time, global_step)
-            
-            lr = optimizer.param_groups[0].get('lr', 0)
-            
-            print("\n" + "="*80)
-            print(f"EVALUATION REPORT - STEP {global_step}")
-            print("="*80)
-            print("Metrics:")
-            print(f"  • Loss:            {eval_loss_avg:.4f}")
-            print(f"  • Word Error Rate:    {metrics['wer']:.2f}%")
-            print(f"  • Character Error Rate: {metrics.get('cer', 0):.2f}%")
-            print("Stats:")
-            print(f"  • Learning Rate:      {lr:.8f}")
-            print(f"  • Eval Batches:        {batch_count}")
-            print(f"  • Eval Samples:        {total_samples}")
-            print(f"  • Eval Time:          {eval_time:.2f}s ({total_samples/eval_time:.2f} samples/sec)")
-            print(f"  • Training Speed:    {samples_per_sec:.2f} samples/sec")
-            
-            if len(all_predictions) > 0:
-                print("\nSample Predictions:")
-                sample_indices = range(min(3, len(all_predictions)))
-                for idx in sample_indices:
-                    pred_str = tokenizer.decode(all_predictions[idx], skip_special_tokens=True)
-                    label_str = tokenizer.decode(all_labels[idx], skip_special_tokens=True)
-                    print(f"  Example {idx+1}:")
-                    print(f"    • Reference: {label_str}")
-                    print(f"    • Prediction: {pred_str}")
-            print("="*80 + "\n")
-            
-            logging.info(f"EVALUATION STEP {global_step} - WER: {metrics['wer']:.2f}%, Loss: {eval_loss_avg:.4f}, LR: {lr:.8f}")
-            scheduler.step()
+
+            lr = scheduler.get_last_lr()[0]
+            print(f" • WER:{metrics['wer']:.2f}% • Loss:{loss_avg:.4f} • LR:{lr:.8f}")
+
+            logging.info(f"EVALUATION STEP {global_step} - WER: {metrics['wer']:.2f}%, Loss: {loss_avg:.4f}, LR: {lr:.8f}")
+            #scheduler.step()
             model.train()
 
         if global_step % save_interval == 0:
             checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_step_{global_step}.pt')
             torch.save(model.state_dict(), checkpoint_path)
-            print(f"Model saved at step {global_step} to {checkpoint_path}")
+            #print(f"Model saved at step {global_step} to {checkpoint_path}")
             logging.info(f"Model saved at step {global_step} to {checkpoint_path}")
-
+            
+        lr = scheduler.get_last_lr()[0]
+        scheduler.step()
         global_step += 1
         step_in_report += 1
-        progress_bar.update(1)
         
+        avg_loss = total_loss / (global_step + 1)
+        postfix_dict = {
+            'loss': f'{avg_loss:.4f}',
+            'lr': f'{lr:.6f}',
+            'WER': f'{metrics["wer"]:.4f}' if 'wer' in metrics else 'N/A',
+            'samp/sec': f'{samples_per_sec:.1f}'
+        }
+        progress_bar.set_postfix(postfix_dict, refresh=True)
+        progress_bar.update(1)
+
     final_model_path = os.path.join(checkpoint_dir, 'final_model.pt')
     torch.save(model.state_dict(), final_model_path)
     print(f"Training completed after {global_step} steps. Final model saved to {final_model_path}")
@@ -1764,7 +1597,7 @@ def traiand_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, sch
     progress_bar.close()
 
 
-
+# %%
 
 if __name__ == "__main__":
 
@@ -1785,8 +1618,40 @@ if __name__ == "__main__":
         trust_remote_code=True,
         cache_dir="E:/cache",
     ).select_columns(column_names=["audio", "transcription"])
+   
+    debug = None
+    param = Dimensions(
+        mels=128,
+        audio_ctx=1500,
+        audio_head=4,
+        audio_layerA=4,
+        audio_layerB=2,
+        audio_dims=512,
+        audio_act="gelu",
+        audio_checkpoint=False,
+        audio_dropout=0.001,
+        scale_embedding=1.0,
+        audio_debug = debug,
+        vocab=51865,
+        text_ctx=448,
+        text_head=4,
+        text_layerA=4,
+        text_layerB=0,
+        text_dims=512,
+        text_act="gelu",
+        text_checkpoint=False,
+        text_dropout=0.001,
+        text_debug = debug,
+         )
+    
+    model = Echo(param=param).to('cuda')
+    model.init_weights()
 
-    DataCollator = DataCollator(tokenizer=tokenizer)
+    DataCollator = DataCollator(tokenizer=tokenizer, 
+                                audio_ctx=param.audio_ctx, 
+                                text_ctx=param.text_ctx, 
+                                mels=param.mels, 
+                                device='cuda')
 
     train_dataloader = DataLoader(
         dataset=dataset["train"], 
@@ -1800,60 +1665,39 @@ if __name__ == "__main__":
         collate_fn=DataCollator,
         num_workers=0)
     
-    param = Dimensions(
-        mels=128,
-        audio_ctx=1500,
-        audio_head=4,
-        audio_layerA=4,
-        audio_layerB=4,
-        audio_dims=1024,
-        audio_act="gelu",
-        audio_debug=False,
-        audio_checkpoint=False,
-        audio_dropout=0.001,
-        scale_embedding=1.0,
-        vocab=51865,
-        text_ctx=448,
-        text_head=4,
-        text_layerA=4,
-        text_layerB=2,
-        text_dims=1024,
-        text_act="gelu",
-        text_debug=False,
-        text_checkpoint=False,
-        text_dropout=0.001)
-    
-    
 
-    model = Echo(param=param).to('cuda')
-    model.init_weights()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01, eps=1e-6, betas=(0.9, 0.98))
-    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.5, total_iters=100000, last_epoch=-1)
+    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.25, total_iters=10000, last_epoch=-1)
 
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
-    
-    # for idx, m in enumerate(model.modules()): # uncomment to print model modules
-    #     print(idx, '->', m)
         
-    traiand_evaluate(model=model, 
+    train_and_evaluate(model=model, 
         tokenizer=tokenizer, 
         train_loader=train_dataloader, 
         eval_loader=eval_dataloader, 
         optimizer=optimizer, 
         scheduler=scheduler, 
         loss_fn=loss_fn, 
-        max_steps=100000,
+        max_steps=10000,
         device='cuda', 
         accumulation_steps=1, 
-        clear_cache=True, 
+        clear_cache=False, 
         log_interval=10, 
-        eval_interval=100, 
-        save_interval=25000, 
+        eval_interval=500, 
+        save_interval=10000, 
         checkpoint_dir=checkpoint_dir, 
         log_dir=log_dir
         )
 
+
+# %%
+from tensorboard import program
+log_dir = "./output/logs" 
+tb = program.TensorBoard()
+tb.configure(argv=[None, '--logdir', log_dir])
+url = tb.launch()
+print(f"TensorBoard started at {url}")
 
 
 
