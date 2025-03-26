@@ -1,4 +1,3 @@
-# %%
 import os
 import math
 import warnings
@@ -7,6 +6,7 @@ import logging
 import torch
 from torch import nn, Tensor
 import numpy as np
+
 from torch.amp import autocast
 from torch.nn import functional as F
 from typing import Tuple, Optional, Dict
@@ -14,18 +14,14 @@ import gzip
 import base64
 from datetime import datetime
 from itertools import chain
-# from separated_attention import QueryModule, KeyModule, ValueModule, AttentionCombiner
-# Data handling libraries
+from contextlib import contextmanager
 import torchaudio
 from einops import rearrange
-# from torchaudio.transforms import MelSpectrogram
 import torchaudio.transforms as T
 from torch.utils.data import DataLoader
-from torch.utils.checkpoint import checkpoint
 from torch.nn.functional import scaled_dot_product_attention
 from torch.utils.tensorboard.writer import SummaryWriter
 
-# ML libraries
 import evaluate
 from datasets import load_dataset
 from transformers import WhisperTokenizer
@@ -33,7 +29,6 @@ import transformers
 from tqdm.notebook import tqdm
 from dataclasses import dataclass
 
-# Set up environment
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
 transformers.utils.logging.set_verbosity_error()
@@ -42,6 +37,7 @@ dtype = torch.float32
 torch.set_default_dtype(dtype)
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
+
 
 @dataclass
 class Dimensions:
@@ -53,9 +49,9 @@ class Dimensions:
     text_layerB: int
     text_act: str
     text_debug: int
-    text_dropout: float
     text_checkpoint: bool
-
+    scale_text_embedding: bool
+    
     mels: int
     audio_ctx: int
     audio_dims: int
@@ -64,9 +60,15 @@ class Dimensions:
     audio_layerB: int
     audio_act: str
     audio_debug: int
-    audio_dropout: float
     audio_checkpoint: bool
-    scale_embedding: float
+    scale_audio_embedding: bool
+  
+def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
+    shifted_input_ids = input_ids.new_zeros(input_ids.shape)
+    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
+    shifted_input_ids[:, 0] = decoder_start_token_id
+    shifted_input_ids.masked_fill_(shifted_input_ids == -100, pad_token_id)
+    return shifted_input_ids
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
@@ -89,6 +91,15 @@ class Conv1d(nn.Conv1d):
 def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
     return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
 
+
+class Conv2d(nn.Conv2d):
+    def _conv_forward(
+        self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
+    ) -> Tensor:
+        return super()._conv_forward(
+            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
+        )
+
 class ParameterCycler:
     def __init__(self, parameters):
         self.parameters = parameters
@@ -102,8 +113,115 @@ class ParameterCycler:
 def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
     return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
 
-
-# %%
+class NeuralTransformer(nn.Module):
+    def __init__(self, dims, head, n_layers=6, sparsity_threshold=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        self.n_layers = n_layers
+        self.sparsity_threshold = sparsity_threshold
+        
+        self.shared_head = nn.MultiheadAttention(dims, head)
+        
+        self.node_predictors = nn.ModuleList([
+            nn.Sequential(
+                LayerNorm(dims),
+                Linear(dims, 1),
+                nn.Sigmoid()
+            ) for _ in range(n_layers)
+        ])
+        
+        for i in range(n_layers):
+            self.layers.append(nn.ModuleDict({
+                'ln': LayerNorm(dims),
+                'gate': nn.Sequential(Linear(dims, 1), nn.Sigmoid()),
+                'adapter': Linear(dims, dims) if i % 2 == 0 else None
+            }))
+        
+        self.policy_net = nn.Sequential(
+            Linear(dims, 128),
+            nn.ReLU(),
+            Linear(128, 3)
+        )
+        
+        self.jump_weights = nn.Parameter(torch.tensor([0.1, 0.05, 0.01]))
+        
+        n_mlp = dims * 4
+        self.mlp_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
+        self.mlp = nn.Sequential(Linear(dims, n_mlp), nn.GELU(), Linear(n_mlp, dims))
+        self.mlp_ln = LayerNorm(dims)
+        
+        self.working_memory = nn.Parameter(torch.zeros(1, 1, dims))
+        self.memory_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
+        
+    def predict_node_importance(self, x, layer_idx):
+        """Dynamically determine if processing should occur at this node"""
+        importance = self.node_predictors[layer_idx](x)
+        return (importance > self.sparsity_threshold).float()
+    
+    def forward(self, x, xa=None, mask=None, kv_cache=None):
+        batch_size, seq_len = x.shape[:2]
+        
+        working_memory = self.working_memory.expand(batch_size, -1, -1)
+        
+        original_x = x
+        
+        pooled_representation = x.mean(dim=1)
+        policy_logits = self.policy_net(pooled_representation)
+        policy = F.softmax(policy_logits, dim=-1)
+        
+        jump_history = []
+        i = 0
+        while i < self.n_layers:
+            layer = self.layers[i]
+            
+            node_importance = self.predict_node_importance(x, i)
+            
+            if node_importance.mean() < 0.2 and i > 0:
+                i += 1
+                jump_history.append(i)
+                continue
+                
+            norm_x = layer['ln'](x)
+            
+            attn_mask = mask
+            if mask is None:
+                attn_mask = node_importance.squeeze(-1).unsqueeze(1).expand(-1, seq_len, -1)
+            else:
+                attn_mask = mask * node_importance.squeeze(-1).unsqueeze(1).expand(-1, seq_len, -1)
+                
+            if node_importance.mean() > 0.3:
+                attn_output = self.shared_head(norm_x, mask=attn_mask, kv_cache=kv_cache)[0]
+                
+                if layer['adapter'] is not None:
+                    attn_output = layer['adapter'](attn_output)
+                
+                gate_value = layer['gate'](norm_x).unsqueeze(-1)
+                x = x + gate_value * attn_output
+                
+                memory_gate = self.memory_gate(x)
+                working_memory = memory_gate * working_memory + (1 - memory_gate) * x.mean(dim=1, keepdim=True)
+            
+            jump_prob = policy[:, 1] if i < self.n_layers - 1 else torch.zeros_like(policy[:, 1])
+            should_jump = (torch.rand_like(jump_prob) < jump_prob).any()
+            
+            if should_jump:
+                jump_length = torch.multinomial(policy, 1)[:, 0].max().item() + 1
+                
+                i_next = min(i + jump_length, self.n_layers - 1)
+                skip_weight = self.jump_weights[min(jump_length-1, 2)]
+                
+                x = x + skip_weight * original_x + (1-skip_weight) * working_memory
+                
+                i = i_next
+                jump_history.append(i)
+            else:
+                i += 1
+        
+        mlp_importance = self.mlp_gate(x)
+        mlp_output = self.mlp(self.mlp_ln(x))
+        x = x + mlp_importance * mlp_output
+        
+        return x, {'jumps': jump_history}
 
 class rotary(nn.Module):
     def __init__(self, dims, head, freq=10000, debug=False):
@@ -167,7 +285,7 @@ class rotary(nn.Module):
         cos_ht = torch.cos(theta / 2)
         sin_ht = torch.sin(theta / 2)
         q = torch.cat([cos_ht.unsqueeze(0), sin_ht * u])
-        q_conj = torch.cat([cos_ht.unsqueeze(0), -sin_ht * u])  # noqa: F841
+        q_conj = torch.cat([cos_ht.unsqueeze(0), -sin_ht * u])
         x_shape = x.shape
         x = x.view(-1, 3)
         uv_cross = torch.cross(u.unsqueeze(0), x)
@@ -191,7 +309,7 @@ class rotary(nn.Module):
             G = (G + Q) / 2
         return G
 
-    def rotations(self, x): # dparam = nn.Parameter(torch.zeros(1))
+    def rotations(self, x):
         direction = torch.sigmoid(self.dparam) * 2 - 1
         rotate = int(torch.round(self.rscale * self.rot))
         for k in range(rotate):
@@ -226,12 +344,12 @@ class rotary(nn.Module):
         x = rearrange(x, '(b s) h d -> b s (h d)', b=batch, h=self.head)
         
         position = torch.arange(end=self.ctx, device=device, dtype=dtype)
-        position = rearrange(tensor=position, pattern='s -> s 1')  # [ctx, 1]
-        div_term = rearrange(tensor=self.invf, pattern='d -> 1 d')  # [1, dim/2]
-        sinusoid = position * div_term  # [ctx, dim/2]
+        position = rearrange(tensor=position, pattern='s -> s 1')
+        div_term = rearrange(tensor=self.invf, pattern='d -> 1 d')
+        sinusoid = position * div_term
 
-        sin = rearrange(tensor=torch.sin(input=sinusoid), pattern='s d -> 1 s 1 d')  # [1, ctx, 1, dim/2]
-        cos = rearrange(tensor=torch.cos(input=sinusoid), pattern='s d -> 1 s 1 d')  # [1, ctx, 1, dim/2]
+        sin = rearrange(tensor=torch.sin(input=sinusoid), pattern='s d -> 1 s 1 d')
+        cos = rearrange(tensor=torch.cos(input=sinusoid), pattern='s d -> 1 s 1 d')
         
         x = rearrange(tensor=x, pattern='b s (h d) -> b s h d', h=self.head)
         x1, x2 = x[..., ::2], x[..., 1::2]
@@ -250,71 +368,54 @@ def sinusoids(length, channels, max_timescale=10000):
     scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
-
-# %%
+@contextmanager
+def disable_sdpa():
+    prev_state = MultiheadA.use_sdpa
+    try:
+        MultiheadA.use_sdpa = False
+        yield
+    finally:
+        MultiheadA.use_sdpa = prev_state
 
 class MultiheadA(nn.Module):
     use_sdpa = True
 
-    def __init__(self, dims: int, head: int, max_dist: int=256):
+    def __init__(self, dims: int, head: int, max_dist=512):
         super().__init__()
         self.head = head
-        self.max_dist = max_dist
-        self.dims = dims
         self.head_dim = dims // head
-        self.scale = self.head_dim ** -0.25
-
+        self.max_dist = max_dist
+        self.scale = self.head_dim ** -0.5
         self.query = Linear(dims, dims)
         self.key = Linear(dims, dims, bias=False)
         self.value = Linear(dims, dims)
         self.out = Linear(dims, dims)
 
-    def forward(
-        self,
-        x: Tensor,
-        xa: Optional[Tensor] = None,
-        mask: Optional[Tensor] = None,
-        kv_cache: Optional[dict] = None,
-    ):
-        batch, ctx, _ = x.size()
-        q = self.query(x)
+    def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None):
         
+        q = self.query(x)
         if kv_cache is None or xa is None or self.key not in kv_cache:
             k = self.key(x if xa is None else xa)
             v = self.value(x if xa is None else xa)
         else:
             k = kv_cache[self.key]
             v = kv_cache[self.value]
-
-        wv, qk = self.qkv_attention(q, k, v, mask)
+        wv, qk = self._attention(q, k, v, mask)
         return self.out(wv), qk
-    
-    @autocast('cuda', enabled = True)
-    def qkv_attention(
-        self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        n_batch, ctx, dims = q.shape
-        scale = (dims // self.head) ** -0.25
+
+    def _attention(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        
+        batch, ctx, dims = q.shape
+        scale = (dims // self.head) ** -0.5
+
         q = q.view(*q.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         k = k.view(*k.shape[:2], self.head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.head, -1).permute(0, 2, 1, 3)
 
-    
-        if  MultiheadA.use_sdpa:
-            a = scaled_dot_product_attention(
-                q, k, v, is_causal=mask is not None and ctx > 1
-            )
+        if MultiheadA.use_sdpa:
+            a = scaled_dot_product_attention(q, k, v, is_causal=mask is not None and ctx > 1, scale=scale)
             out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = None
-        else:
-            qk = (q * scale) @ (k * scale).transpose(-1, -2)
-            if mask is not None:
-                qk = qk + mask[:ctx, :ctx]
-            qk = qk.float()
-
-            w = F.softmax(qk, dim=-1).to(q.dtype)
-            out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
-            qk = qk.detach()
 
         return out, qk
 
@@ -403,7 +504,6 @@ class KeyValueModule(nn.Module):
         v = self.value_module(x)
         return k, v
 
-
 class AttentionCombiner(nn.Module):
     """Combines separate Q and KV representations for attention computation."""
     use_sdpa = True
@@ -476,10 +576,8 @@ class AttentionCombiner(nn.Module):
         output = attn_output.permute(0, 2, 1, 3).reshape(batch, ctx, self.dims)
         return self.out(output)
 
-
 class AdaptiveUpdateAttention(nn.Module):
-    """Attention implementation with content-dependent update frequencies."""
-    def __init__(self, dims: int, head: int, max_dist=256):
+    def __init__(self, dims: int, head: int, max_dist=512):
         super().__init__()
         self.query_module = QueryModule(dims, head)
         self.key_module = KeyModule(dims, head)
@@ -502,17 +600,14 @@ class AdaptiveUpdateAttention(nn.Module):
         self.stored_value_cache = None
 
     def should_update_key(self, x: torch.Tensor) -> torch.Tensor:
-        """Predict whether the key should be updated based on content."""
         avg_rep = x.mean(dim=1)
         return self.key_update_predictor(avg_rep) > self.update_threshold
 
     def should_update_value(self, x: torch.Tensor) -> torch.Tensor:
-        """Predict whether the value should be updated based on content."""
         avg_rep = x.mean(dim=1)
         return self.value_update_predictor(avg_rep) > self.update_threshold
 
     def forward(self, x, xa=None, mask=None, kv_cache=None):
-        """Modified forward method to match FocusA's interface"""
         batch, ctx, _ = x.shape
         
         q = self.query_module(x)
@@ -549,12 +644,9 @@ class AdaptiveUpdateAttention(nn.Module):
                     v = new_v
             else:
                 v = self.stored_value_cache if self.stored_value_cache is not None else self.value_module(kv_input)
-            
             self.stored_key_cache = k
             self.stored_value_cache = v
-        
         output = self.combiner(q, k, v, mask=mask)
-        
         return output
     
 class Refiner:
@@ -663,6 +755,7 @@ class IntegratedAttention(nn.Module):
         super().__init__()
         self.head = head
         self.max_dist = max_dist
+        self.ctx = ctx
         self.dims = dims
         self.max_span = max_span
         self.sliding_window = win_size
@@ -745,9 +838,9 @@ class IntegratedAttention(nn.Module):
 
     def extract(self, x):
         with torch.no_grad():
-            mean_state = x.mean(dim=(0, 1))
+            meadims = x.mean(dim=(0, 1))
             var_state = x.var(dim=(0, 1), unbiased=False)
-            state = torch.cat([mean_state, var_state])
+            state = torch.cat([meadims, var_state])
             state_id = self.discretize(state.cpu().numpy())
         return state_id
 
@@ -907,17 +1000,14 @@ class IntegratedAttention(nn.Module):
         return output
     
 
-# %%
 class Residual(nn.Module):
-    def __init__(self, dims: int, head: int, dropout: float, act: str, debug=False, cross_attention=False):
+    def __init__(self, dims: int, head: int, act: str, debug=False, cross_attention=False):
         if debug is True:
-            print(f"Residual check:{dims} {head} {dropout} {act}")
+            print(f"Residual check:{dims} {head} {act}")
 
         super().__init__()
-
         self.dims = dims
         self.head = head
-        self.dropout = dropout
         self.act = act
         self.cross_attention = cross_attention
 
@@ -929,17 +1019,15 @@ class Residual(nn.Module):
             "leaky_relu": nn.LeakyReLU(),
             "elu": nn.ELU(),
         }
-        act = act_map.get(act, nn.GELU())
+
+        self.act = act_map.get(act, nn.GELU())
         
         self.attna = MultiheadA(dims=dims, head=head)
-        #self.attnb = IntegratedAttention(dims=dims, head=head) if IntegratedAttention else None
         self.attnc = MultiheadA(dims=dims, head=head) if cross_attention else None
     
         self.mlp = nn.Sequential(
-            nn.Dropout(p=dropout),
             Linear(in_features=dims, out_features=dims * 4, bias=True),
-            act,
-            nn.Dropout(p=dropout),
+            self.act,
             Linear(in_features=dims * 4, out_features=dims, bias=True))
 
         self.lna = LayerNorm(normalized_shape=dims)
@@ -955,16 +1043,16 @@ class Residual(nn.Module):
     ):
         x = x + self.attna(self.lna(x), mask=mask, kv_cache=kv_cache)[0]
         if self.attnc is not None:
-            x = x + self.attnc(self.lnc(x), xa, kv_cache=kv_cache)[0] # type: ignore # head mask revisit
+            x = x + self.attnc(self.lnc(x), xa, kv_cache=kv_cache)[0]
         x = x + self.mlp(self.lnb(x))
         return x
     
 class AudioEncoder(nn.Module):
-    def __init__( self, mels: int, ctx: int, dims: int, head: int, layerA: int, layerB: int, checkpoint: bool, dropout: float, act: str,  
+    def __init__( self, mels: int, ctx: int, dims: int, head: int, layerA: int, layerB: int, checkpoint: bool, act: str,  
                  scale_embedding, debug=None):
         if debug == 1:
             print(
-                f"AudioEncoder check: {mels} {ctx} {dims} {head} {checkpoint} {dropout} {act} {layerA} {layerB}"
+                f"AudioEncoder check: {mels} {ctx} {dims} {head} {checkpoint} {act} {layerA} {layerB}"
             )
         super().__init__()
         self.ctx = ctx
@@ -973,9 +1061,8 @@ class AudioEncoder(nn.Module):
         self.layerA = layerA
         self.layerB = layerB
         self.checkpoint = checkpoint
-        self.dropout = dropout
-        self.act = act
-        self.scale_embedding = scale_embedding
+
+        self.embed_scale = math.sqrt(dims) if scale_embedding else 1.0
         self.rotary = rotary(dims=dims, head=head)
 
         act_map = {
@@ -984,58 +1071,67 @@ class AudioEncoder(nn.Module):
             "sigmoid": nn.Sigmoid(),
             "tanh": nn.Tanh(),
             "leaky_relu": nn.LeakyReLU(),
-            "elu": nn.ELU(),
+            "elu": nn.ELU()
         }
-        act = act_map.get(act, nn.GELU())
+        self.act = act_map.get(act, nn.GELU())
 
         self.conv1 = Conv1d(mels, dims, kernel_size=3, padding=1)
         self.conv2 = Conv1d(dims, dims, kernel_size=3, stride=2, padding=1)
-        self.register_buffer("positional_embedding", sinusoids(ctx, dims))
 
-        self.blockA = ( nn.ModuleList( modules=[ Residual(dims=dims, head=head, dropout=dropout, act=act, debug=debug) 
+        self.register_buffer("positional_embedding", sinusoids(ctx, dims))
+        self.embed_positions = nn.Embedding(ctx, dims)
+        self.embed_positions.requires_grad_(False)
+
+        self.blockA = ( nn.ModuleList( modules=[ Residual(dims=dims, head=head, act=act) 
                                                 for _ in range(layerA) ] ) if layerA > 0 else None )
 
         self.blockB = ( nn.ModuleList( modules=[ IntegratedAttention(ctx=ctx, dims=dims, head=head)
                                                 for _ in range(layerB) ] ) if layerB > 0 else None )
         self.ln_enc = LayerNorm(dims)
+        self.rms_enc = nn.RMSNorm(dims)
+        self.expected_seq_length = ctx * self.conv1.stride[0] * self.conv2.stride[0]
 
-    def forward(self, x: Tensor):
-        x = F.gelu(self.conv1(x))
-        x = F.gelu(self.conv2(x))
+    def _freeze_parameters(self):
+        for param in self.parameters():
+            param.requires_grad = False
+        self._requires_grad = False
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.conv1
+
+    def set_input_embeddings(self, value: nn.Module):
+        self.conv1 = value
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.act(self.conv1(x))
+        x = self.act(self.conv2(x)) 
         x = x.permute(0, 2, 1)
-        x = x + self.rotary(x)
-        x = x * self.scale_embedding
-
+        x = self.rotary(x)
+        pos = self.embed_positions.weight
+        x = x + pos  
+        x = self.rms_enc(x)
+        x = nn.functional.dropout(x, p=0.001)
         assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
         x = (x + self.positional_embedding).to(x.dtype)
-
-        x = ( checkpoint(self._forward, x, use_reentrant=True) if self.checkpoint else x ) 
-
         for block in chain(self.blockA or [], self.blockB or []):
-            if self.checkpoint:
-                x = checkpoint(block, x, use_reentrant=True)
+            x = block(x)
+            if isinstance(x, tuple):
+                x = x[0]
             else:
-                result = block(x)
-                if isinstance(result, tuple):
-                    x = result[0]
-                else:
-                    x = result
+                x = x
         x = self.ln_enc(x)
         return x
     
-    def _forward(self, x: Tensor):
-        return x
 
 class TextDecoder(nn.Module):
-    def __init__( self, vocab: int, ctx: int, dims: int, head: int, layerA: int, layerB: int, checkpoint: bool, dropout: float, act: str,  debug=None):
-        if debug == 2: print( f"TextDecoder check: {vocab} {ctx} {dims} {head} {checkpoint} {dropout} {act} {layerA} {layerB}" )  # noqa: E701
+    def __init__( self, vocab: int, ctx: int, dims: int, head: int, layerA: int, layerB: int, checkpoint: bool, act: str,  debug=None):
+        if debug == 2: print( f"TextDecoder check: {vocab} {ctx} {dims} {head} {checkpoint} {act} {layerA} {layerB}" )
         super().__init__() 
         self.checkpoint = checkpoint 
         self.dims = dims 
         self.head = head 
         self.layerA = layerA 
         self.layerB = layerB 
-        self.dropout = dropout 
         self.act = act 
         
         self.token_embedding = nn.Embedding(num_embeddings=vocab, embedding_dim=dims) 
@@ -1046,65 +1142,57 @@ class TextDecoder(nn.Module):
 
         self.ln_dec = LayerNorm(normalized_shape=dims) 
         
-        self.blockA = ( nn.ModuleList( modules=[ Residual(dims=dims, head=head, dropout=dropout, act=act ) 
-                                                for _ in range(layerA) ] ) if layerA > 0 else None ) 
-        
-        self.blockB = ( nn.ModuleList( modules=[ IntegratedAttention(ctx=ctx, dims=dims, head=head)
+        self.blockA = ( nn.ModuleList( modules=[ Residual(dims=dims, head=head, act=act) 
+                                                for _ in range(layerA) ] ) if layerA > 0 else None )
+
+        self.blockB = ( nn.ModuleList( modules=[ AdaptiveUpdateAttention(dims=dims, head=head)
                                                 for _ in range(layerB) ] ) if layerB > 0 else None )
         
-        mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
-        self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
+        self.mask=True
+
+    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None) -> Tensor:
 
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
-        x = (
-            self.token_embedding(x)
-            + self.positional_embedding[offset : offset + x.shape[-1]]
-        )
+        x = (self.token_embedding(x) + self.positional_embedding[offset : offset + x.shape[-1]])
         x = x.to(xa.dtype)
 
         for block in chain(self.blockA or [], self.blockB or []):
             x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
 
         x = self.ln_dec(x)
-        logits = (
-            x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)
-        ).float()
+        logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
         return logits
 
 class Echo(nn.Module):
     def __init__(self, param: Dimensions, debug=None):
         super().__init__()
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.debug = debug
         self.param = param
-        self.to(device)
 
         self.encoder = AudioEncoder(
-            self.param.mels,
-            self.param.audio_ctx,
-            self.param.audio_dims,
-            self.param.audio_head,
-            self.param.audio_layerA,
-            self.param.audio_layerB,
-            self.param.audio_checkpoint,
-            self.param.audio_dropout,
-            self.param.audio_act,
-            self.param.scale_embedding,
-
+            mels=param.mels,
+            ctx=param.audio_ctx,
+            dims=param.audio_dims,
+            head=param.audio_head,
+            layerA=param.audio_layerA,
+            layerB=param.audio_layerB,
+            checkpoint=param.audio_checkpoint,
+            act=param.audio_act,
+            scale_embedding=param.scale_audio_embedding,
+            debug=param.audio_debug,
         )
         self.decoder = TextDecoder(
-            self.param.vocab,
-            self.param.text_ctx,
-            self.param.text_dims,
-            self.param.text_head,
-            self.param.text_layerA,
-            self.param.text_layerB,
-            self.param.text_checkpoint,
-            self.param.text_dropout,
-            self.param.text_act,
+            vocab=param.vocab,
+            ctx=param.text_ctx,
+            dims=param.text_dims,
+            head=param.text_head,
+            layerA=param.text_layerA,
+            layerB=param.text_layerB,
+            checkpoint=param.text_checkpoint,
+            act=param.text_act,
+            debug=param.text_debug,
         )
 
         all_head = torch.zeros(
@@ -1113,6 +1201,12 @@ class Echo(nn.Module):
         all_head[self.param.text_layerA // 2 :] = True
         self.register_buffer("alignment_head", all_head.to_sparse(), persistent=False)
 
+    def to(self, device):
+        super().to(device)
+        self.encoder.to(device)
+        self.decoder.to(device)
+        return self
+    
     def _init_weights(self, module):
         std = 0.02
         self.init_counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "Embedding": 0}
@@ -1137,8 +1231,7 @@ class Echo(nn.Module):
                 if module.padding_idx is not None:
                     module.weight.data[module.padding_idx].zero_()
                 self.init_counts["Embedding"] += 1
-                
-    def init_weights(self):  # noqa: F811
+    def init_weights(self):
         print("Initializing all weights")
         self.apply(self._init_weights)
         print("Initialization summary:")
@@ -1160,17 +1253,24 @@ class Echo(nn.Module):
     def logits(self,input_ids: torch.Tensor, audio_features: torch.Tensor):
         return self.decoder(input_ids, audio_features)
 
-    def forward(self, mel: torch.Tensor, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, input_features: torch.Tensor, input_ids=None, labels=None, decoder_inputs_embeds=None) -> Dict[str, torch.Tensor]:
+
+        if input_ids is None and decoder_inputs_embeds is None:
+            if labels is not None:
+                input_ids = shift_tokens_right(
+                    labels, self.dims.pad_token_id, self.dims.decoder_start_token_id)
+            else:
+                raise ValueError("You have to provide either decoder_input_ids or labels")
+        
+        encoded_audio = self.encoder(input_features)
+        logits = self.decoder(input_ids, encoded_audio)
+        
         loss = None
-        if self.training:
-            audio_features = self.encoder(mel)
-            logits = self.decoder(tokens, audio_features)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), tokens.view(-1))
-            self.update_freq(loss=loss.item())
-        else:
-            audio_features = self.encoder(mel)
-            logits = self.decoder(tokens, audio_features)
-        return {"loss": loss, "logits": logits}
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=-100)
+        
+        return {"logits": logits, "loss": loss, "labels": labels, "input_ids": input_ids}
 
     
     @property
@@ -1217,7 +1317,6 @@ class Echo(nn.Module):
             elif isinstance(layer, AdaptiveUpdateAttention):
                 hooks.append(layer.register_forward_hook(save_adaptive_output))
 
-        # Apply hooks to both encoder and decoder if needed
         if self.blockB and any(isinstance(m, AdaptiveUpdateAttention) for m in self.blockB):
             self.encoder.apply(install_hooks)
         self.decoder.apply(install_hooks)
@@ -1245,8 +1344,94 @@ class Echo(nn.Module):
     def generate(self, mel: torch.Tensor, max_length: int = 512) -> torch.Tensor:
         audio_features = self.encoder(mel)
         return self.decoder.generate(audio_features, max_length=max_length)
+    
+class MaxFactor(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.01, beta2_decay=-0.8, eps=(1e-10, 1e-3), d=1.0, 
+                 weight_decay=0.01, gamma=0.99, max=False):
+        
+        defaults = dict(lr=lr, beta2_decay=beta2_decay, eps=eps, d=d, weight_decay=weight_decay, 
+                        gamma=gamma, max=max)
+        super().__init__(params=params, defaults=defaults)
 
-# %%
+    @staticmethod
+    def _rms(tensor):
+        return tensor.norm() / (tensor.numel() ** 0.5)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            params_with_grad, grads, row_vars, col_vars, v, state_steps = [], [], [], [], [], []
+            eps1, eps2 = group["eps"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.dtype in {torch.float16, torch.bfloat16}:
+                    grad = grad.float()
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = torch.tensor(0.0, dtype=torch.float32)
+                    if p.grad.dim() > 1:
+                        row_shape, col_shape = list(p.grad.shape), list(p.grad.shape)
+                        row_shape[-1], col_shape[-2] = 1, 1
+                        state["row_var"], state["col_var"] = p.grad.new_zeros(row_shape), p.grad.new_zeros(col_shape)
+                    state["v"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state["RMS"] = self._rms(p).item()
+
+                row_vars.append(state.get("row_var", None))
+                col_vars.append(state.get("col_var", None))
+                v.append(state["v"])
+                state_steps.append(state["step"])
+                params_with_grad.append(p)
+                grads.append(grad)
+
+            for i, param in enumerate(params_with_grad):
+                grad = grads[i]
+
+                if group["max"]:
+                    grad = -grad
+                step_t, row_var, col_var, vi = state_steps[i], row_vars[i], col_vars[i], v[i]
+
+                if eps1 is None:
+                    eps1 = torch.finfo(param.dtype).eps
+                    
+                step_t += 1
+                step_float = step_t.item()
+                
+                one_minus_beta2_t = step_float ** group["beta2_decay"]
+                state["RMS"] = self._rms(param).item()
+                
+                rho_t = min(group["lr"], 1 / (step_float ** 0.5))
+                alpha = max(eps2, param.norm(2).item() / (param.numel() ** 0.5)) * rho_t
+
+                if group["weight_decay"] != 0:
+                    param.mul_(1 - group["lr"] * group["weight_decay"])
+
+                if grad.dim() > 1:
+                    row_mean = torch.norm(grad, dim=-1, keepdim=True).square_().div_(grad.size(-1) + 1e-8)
+                    row_var.lerp_(row_mean, one_minus_beta2_t)
+                    col_mean = torch.norm(grad, dim=-2, keepdim=True).square_().div_(grad.size(-2) + 1e-8)
+                    col_var.lerp_(col_mean, one_minus_beta2_t)
+                    var_estimate = row_var @ col_var
+                    max_row_var = row_var.max(dim=-2, keepdim=True)[0]  
+                    var_estimate.div_(max_row_var.clamp_(min=eps1))
+                else:
+                    vi.mul_(group["gamma"]).add_(grad ** 2, alpha=1 - group["gamma"])
+                    var_estimate = vi
+
+                update = var_estimate.clamp_(min=eps1 * eps1).rsqrt_().mul_(grad)
+                update = update.div_(torch.norm(update, float('inf')).clamp_(min=eps1))
+                denom = max(1.0, update.norm(2).item() / ((update.numel() ** 0.5) * group["d"]))
+                
+                param.add_(-alpha / denom * update.sign() * update.abs().max(dim=-1, keepdim=True)[0])
+        return loss
+
 
 def ctx_to_samples(audio_ctx, hop_length):
     samples_token = hop_length * 2
@@ -1261,15 +1446,28 @@ def load_wave(wave_data, sample_rate):
         sr = wave_data["sampling_rate"]
     else:
         raise TypeError("Invalid wave_data format.")
+    
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+    
     if sr != sample_rate:
-        waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sample_rate)(
-            waveform
-        )
+        original_length = waveform.shape[1]
+        target_length = int(original_length * (sample_rate / sr))
+        
+        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sample_rate)
+        waveform = resampler(waveform)
+        
+        if abs(waveform.shape[1] - target_length) > 1:
+            new_waveform = torch.zeros((waveform.shape[0], target_length), dtype=waveform.dtype, device=waveform.device)
+            copy_length = min(waveform.shape[1], target_length)
+            new_waveform[:, :copy_length] = waveform[:, :copy_length]
+            waveform = new_waveform
+    
     return waveform.flatten()
 
 def pad(array, target_length, axis=-1, dtype: torch.dtype = torch.float32):
     if isinstance(array, np.ndarray):
-        array = torch.from_numpy(ndarray=array).to(dtype=dtype)
+        array = torch.from_numpy(array).to(dtype)
     if torch.is_tensor(array):
         if array.shape[axis] > target_length:
             array = array.index_select(
@@ -1325,8 +1523,8 @@ def process_audio(audio, audio_ctx, mels, hop_length, n_fft, sr):
     return log_mel
 
 tokenizer = WhisperTokenizer.from_pretrained(
-    pretrained_model_name_or_path="openai/whisper-small"
-)
+    pretrained_model_name_or_path="openai/whisper-small")
+
 
 class DataCollator:
     def __init__(self, tokenizer, audio_ctx, text_ctx, mels, n_fft=1024, hop_length=160, sample_rate=16000, device="cpu"):
@@ -1338,36 +1536,18 @@ class DataCollator:
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.device = device
-        self.decoder_start_token_id = tokenizer.bos_token_id 
-        self.pad_token_id = tokenizer.pad_token_id
+        self.decoder_start_token_id = 50258
+        self.pad_token_id = 50257
+        self.eos_token_id = 50257
 
     def __call__(self, features):
         batch = len(features)
 
-        max_time_frames = (
-            ctx_to_samples(audio_ctx=self.audio_ctx, hop_length=self.hop_length)
-            // self.hop_length
-        )
-        batch_audio = torch.zeros(
-            size=(batch, self.mels, max_time_frames),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        batch_input_ids = torch.full(
-            size=(batch, self.text_ctx),
-            fill_value=self.pad_token_id,
-            dtype=torch.long,
-            device=self.device,
-        )
-        batch_labels = torch.full(
-            size=(batch, self.text_ctx),
-            fill_value=-100,
-            dtype=torch.long,
-            device=self.device,
-        )
-
-        for i, feature in enumerate(iterable=features):
-
+        max_time_frames = 0
+        max_text_length = 0
+        
+        processed_features = []
+        for feature in features:
             audio = process_audio(
                 audio=feature["audio"],
                 audio_ctx=self.audio_ctx,
@@ -1377,18 +1557,52 @@ class DataCollator:
                 sr=self.sample_rate,
             )
             time_frames = audio.shape[-1]
+            max_time_frames = max(max_time_frames, time_frames)
+            
             transcript = feature["transcription"]
-            encoded_input = self.tokenizer.encode(transcript)
-            encoded_label = self.tokenizer.encode(transcript)
+            encoded_input = self.tokenizer.encode(transcript, add_special_tokens=False)
+            encoded_label = self.tokenizer.encode(transcript, add_special_tokens=False)
+            
             decoder_input = [self.decoder_start_token_id] + encoded_input
-            labels = encoded_label + [self.tokenizer.eos_token_id]
-            decoder_input = decoder_input[: self.text_ctx] + [self.pad_token_id] * (
-                self.text_ctx - len(decoder_input)
-            )
-            labels = labels[: self.text_ctx] + [-100] * (self.text_ctx - len(labels))
-            batch_input_ids[i, : len(decoder_input)] = torch.tensor(data=decoder_input, dtype=torch.long)
-            batch_labels[i, : len(labels)] = torch.tensor(data=labels, dtype=torch.long)
+            labels = encoded_label + [self.eos_token_id]
+            
+            max_text_length = max(max_text_length, len(decoder_input), len(labels))
+            
+            processed_features.append({
+                "audio": audio,
+                "decoder_input": decoder_input,
+                "labels": labels
+            })
+        
+        max_text_length = min(max_text_length, self.text_ctx)
+        
+        batch_audio = torch.zeros(
+            size=(batch, self.mels, max_time_frames),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        batch_input_ids = torch.full(
+            size=(batch, max_text_length),
+            fill_value=self.pad_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        batch_labels = torch.full(
+            size=(batch, max_text_length),
+            fill_value=-100,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        for i, feature in enumerate(processed_features):
+            audio = feature["audio"]
+            time_frames = audio.shape[-1]
+            decoder_input = feature["decoder_input"][:max_text_length]
+            labels = feature["labels"][:max_text_length]
+            
             batch_audio[i, :, :time_frames] = torch.tensor(data=audio, dtype=torch.float32)
+            batch_input_ids[i, :len(decoder_input)] = torch.tensor(data=decoder_input, dtype=torch.long)
+            batch_labels[i, :len(labels)] = torch.tensor(data=labels, dtype=torch.long)
 
         return {
             "input_features": batch_audio,
@@ -1410,17 +1624,57 @@ def compute_metrics(pred, tokenizer):
     label_ids[label_ids == -100] = tokenizer.pad_token_id
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    wer = 100 * metric.compute(predictions=pred_str, references=label_str) # type: ignore
+    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
     return {"wer": wer}
 
+def generate_predictions(model, input_features_encoded, tokenizer, device, batch_size, min_length):
+    decoder_start_token_id = tokenizer.bos_token_id
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id
+    
+    generated_ids = torch.full(
+        size=(batch_size, 1), 
+        fill_value=decoder_start_token_id, 
+        dtype=torch.long, 
+        device=device
+    )
+    
+    max_length = 448
+    all_sequences_finished = False
+    
+    finished_sequences = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    
+    for i in range(max_length - 1):
+        attention_mask = torch.ones_like(generated_ids)
+        
+        with torch.no_grad():
+            outputs = model(
+                input_features=input_features_encoded,
+                decoder_input_ids=generated_ids,
+                decoder_attention_mask=attention_mask
+            )
+            
+        next_token_logits = outputs.logits[:, -1, :]
+        
+        if i < min_length:
+            next_token_logits[:, eos_token_id] = float('-inf')
+        next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+        generated_ids = torch.cat([generated_ids, next_tokens], dim=1)
+        finished_sequences = finished_sequences | (next_tokens.squeeze(-1) == eos_token_id)
+        if finished_sequences.all() and i >= min_length:
+            break
+    
+    if generated_ids.size(1) < max_length:
+        generated_ids = torch.nn.functional.pad(
+            input=generated_ids, 
+            pad=(0, max_length - generated_ids.size(1)), 
+            value=pad_token_id)
+    
+    return generated_ids
 
-# %%
-
-
-def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn,
-                        max_steps=10000, device='cuda', accumulation_steps=1, clear_cache=True,
-                        log_interval=10, eval_interval=100, save_interval=1000,
-                        checkpoint_dir="checkpoint_dir", log_dir="log_dir"):
+def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn, max_steps=10000, device='cuda', 
+    accumulation_steps=1, clear_cache=True, log_interval=10, eval_interval=100, save_interval=1000, checkpoint_dir="checkpoint_dir", log_dir="log_dir"):
+    
     model.to(device)
     global_step = 0
     scaler = torch.GradScaler()
@@ -1434,6 +1688,14 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
 
     model.train()
     optimizer.zero_grad()
+
+    profiler = torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=1, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(log_dir),
+        record_shapes=True, profile_memory=True, with_stack=True)
+
+    profiler.start()
 
     while global_step < max_steps:
         try:
@@ -1466,10 +1728,10 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
             active_logits = active_logits[active_mask]
             active_labels = active_labels[active_mask]
             loss = loss_fn(active_logits, active_labels)
-            # model.adjust_freq(loss=loss.item())
+
         total_loss += loss.item()
         loss = loss / accumulation_steps
-        
+
         scaler.scale(loss).backward()
 
         if (global_step + 1) % accumulation_steps == 0:
@@ -1486,11 +1748,12 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
         samples_per_sec = len(batch['input_features']) / (end_time - start_time)
 
         if global_step % log_interval == 0:
-            writer.add_scalar(tag='Loss/train', scalar_value=total_loss / (global_step + 1), global_step=global_step)
             lr = scheduler.get_last_lr()[0]
+            writer.add_scalar(tag='Loss/train', scalar_value=total_loss / (global_step + 1), global_step=global_step)
             writer.add_scalar(tag='LearningRate', scalar_value=lr, global_step=global_step)
             writer.add_scalar(tag='SamplesPerSec', scalar_value=samples_per_sec, global_step=global_step)
-
+            logging.info(f"Step {global_step} - Loss: {total_loss / (global_step + 1):.4f}, LR: {lr:.8f}")
+        
         if global_step % eval_interval == 0:
             model.eval()
             eval_start_time = time.time()
@@ -1502,23 +1765,24 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
 
             with torch.no_grad():
                 for eval_batch in eval_loader:
-                # for eval_batch in tqdm(eval_loader, desc=f"Evaluating (Step {global_step})", leave=True, colour='green'):
                     input_features = eval_batch['input_features'].to(device)
                     input_ids = eval_batch['input_ids'].to(device)
                     labels = eval_batch['labels'].long().to(device)
 
-                    batch = input_features.size(0)
-                    total_samples += batch
+                    batch_size = input_features.size(0)
+                    total_samples += batch_size
 
                     input_features_encoded = model.encoder(input_features)
                     decoder_output = model.decoder(input_ids, input_features_encoded)
                     logits = decoder_output.view(-1, decoder_output.size(-1))
                     loss = loss_fn(logits, labels.view(-1))
                     eval_loss += loss.item()
+
                     all_predictions.extend(torch.argmax(decoder_output, dim=-1).cpu().numpy().tolist())
                     all_labels.extend(labels.cpu().numpy().tolist())
                     batch_count += 1
 
+            lr = scheduler.get_last_lr()[0]
             eval_time = time.time() - eval_start_time
             loss_avg = eval_loss / batch_count if batch_count > 0 else 0
             predictions = {"predictions": np.array(all_predictions, dtype=object), "label_ids": np.array(all_labels, dtype=object)}
@@ -1529,42 +1793,44 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
             writer.add_scalar('EvalSamples', total_samples, global_step)
             writer.add_scalar('EvalTimeSeconds', eval_time, global_step)
 
-            lr = scheduler.get_last_lr()[0]
+            pred = tokenizer.decode(all_predictions[0], skip_special_tokens=True)
+            label = tokenizer.decode(all_labels[0], skip_special_tokens=True)
+            
             print(f" • WER:{metrics['wer']:.2f}% • Loss:{loss_avg:.4f} • LR:{lr:.8f}")
-
+            print(f"PRED: '{pred}'")
+            print(f"REF : '{label}'")
+            print()
             logging.info(f"EVALUATION STEP {global_step} - WER: {metrics['wer']:.2f}%, Loss: {loss_avg:.4f}, LR: {lr:.8f}")
-            #scheduler.step()
             model.train()
 
         if global_step % save_interval == 0:
             checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_step_{global_step}.pt')
             torch.save(model.state_dict(), checkpoint_path)
-            #print(f"Model saved at step {global_step} to {checkpoint_path}")
             logging.info(f"Model saved at step {global_step} to {checkpoint_path}")
             
-        lr = scheduler.get_last_lr()[0]
-        scheduler.step()
         global_step += 1
         step_in_report += 1
-        
+
         avg_loss = total_loss / (global_step + 1)
-        postfix_dict = {
-            'loss': f'{avg_loss:.4f}',
-            'lr': f'{lr:.6f}',
-            'WER': f'{metrics["wer"]:.4f}' if 'wer' in metrics else 'N/A',
-            'samp/sec': f'{samples_per_sec:.1f}'
-        }
+        postfix_dict = {'loss': f'{avg_loss:.4f}', 'lr': f'{lr:.6f}', 'WER': f'{metrics["wer"]:.4f}' if 'wer' in metrics else 'N/A',
+            'samp/sec': f'{samples_per_sec:.1f}'}
         progress_bar.set_postfix(postfix_dict, refresh=True)
         progress_bar.update(1)
-
+        scheduler.step()
+        profiler.step()
+        
+    profiler.stop()
     final_model_path = os.path.join(checkpoint_dir, 'final_model.pt')
     torch.save(model.state_dict(), final_model_path)
     print(f"Training completed after {global_step} steps. Final model saved to {final_model_path}")
     writer.close()
     progress_bar.close()
 
+checkpoint_dir = './output/checkpoints'
+os.makedirs(checkpoint_dir, exist_ok=True)
+log_dir = os.path.join("./output/logs", datetime.now().strftime(format="%m-%d_%H"))
+os.makedirs(name=log_dir, exist_ok=True)
 
-# %%
 
 if __name__ == "__main__":
 
@@ -1577,43 +1843,43 @@ if __name__ == "__main__":
         filename=os.path.join(log_dir, 'training.log'), filemode='w', format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
     token = ""
+
     dataset = load_dataset(
-        path="google/fleurs",
-        name="en_us",
-        streaming=False,
+        path="mozilla-foundation/common_voice_17_0",
+        name="en",
+        streaming=True,
         token=token,
         trust_remote_code=True,
         cache_dir="E:/cache",
-    ).select_columns(column_names=["audio", "transcription"])
+    ).select_columns(column_names=["audio", "sentence"]).rename_column("sentence", "transcription")
    
     debug = None
+    
     param = Dimensions(
         mels=128,
         audio_ctx=1500,
-        audio_head=4,
+        audio_head=8,
         audio_layerA=4,
-        audio_layerB=2,
-        audio_dims=512,
-        audio_act="gelu",
+        audio_layerB=0,
+        audio_dims=1024,
+        audio_act="relu",
         audio_checkpoint=False,
-        audio_dropout=0.001,
-        scale_embedding=1.0,
-        audio_debug = debug,
+        scale_audio_embedding=False,
+        audio_debug=debug,
         vocab=51865,
         text_ctx=448,
-        text_head=4,
+        text_head=8,
         text_layerA=4,
         text_layerB=0,
-        text_dims=512,
-        text_act="gelu",
+        text_dims=1024,
+        text_act="relu",
         text_checkpoint=False,
-        text_dropout=0.001,
-        text_debug = debug,
-         )
+        scale_text_embedding=False,
+        text_debug=debug,
+        )
     
     model = Echo(param=param).to('cuda')
     model.init_weights()
-
     DataCollator = DataCollator(tokenizer=tokenizer, 
                                 audio_ctx=param.audio_ctx, 
                                 text_ctx=param.text_ctx, 
@@ -1627,15 +1893,16 @@ if __name__ == "__main__":
         num_workers=0)
 
     eval_dataloader = DataLoader(
-        dataset=dataset["test"].take(100),
+        dataset=dataset["test"],
         batch_size=1,
         collate_fn=DataCollator,
         num_workers=0)
     
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000, eta_min=1e-5)
 
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01, eps=1e-6, betas=(0.9, 0.98))
-    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.25, total_iters=10000, last_epoch=-1)
+    # optimizer = MaxFactor(model.parameters(), lr=0.025)
+    # scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.25, total_iters=10000, last_epoch=-1)
 
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
         
@@ -1658,7 +1925,6 @@ if __name__ == "__main__":
         )
 
 
-# %%
 from tensorboard import program
 log_dir = "./output/logs" 
 tb = program.TensorBoard()
