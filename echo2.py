@@ -1,3 +1,4 @@
+# %%
 import os
 import math
 import warnings
@@ -42,6 +43,7 @@ tokenizer = WhisperTokenizer.from_pretrained(
     pretrained_model_name_or_path="openai/whisper-small")
 
 
+# %%
 @dataclass
 class Dimensions:
     vocab: int
@@ -69,6 +71,23 @@ class Dimensions:
     eos_token_id: int
     decoder_start_token_id: int
   
+
+def create_attention_mask(batch_size, seq_len, is_causal=True, padding_mask=None, device=None):
+    """Create a standardized attention mask for all attention mechanisms"""
+    if is_causal:
+        mask = torch.triu(
+            torch.ones((seq_len, seq_len), device=device), diagonal=1
+        ).bool()
+        mask = mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
+    else:
+        mask = torch.zeros((batch_size, 1, seq_len, seq_len), device=device).bool()
+    
+    if padding_mask is not None:
+        padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)
+        mask = mask | (~padding_mask)
+    
+    return mask
+
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
     shifted_input_ids = input_ids.new_zeros(input_ids.shape)
     shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
@@ -168,6 +187,9 @@ class PositionalEncoding(nn.Module):
         x = x * math.sqrt(self.dims)
         x = x + pe
         return x
+
+
+# %%
 
 class RotaryEmbedding(nn.Module):
 
@@ -387,6 +409,9 @@ class RotaryEmbedding(nn.Module):
         freqs = torch.repeat_interleave(freqs, 2, dim=-1)
         return freqs
 
+
+# %%
+
 @contextmanager
 def disable_sdpa():
     prev_state = MultiheadA.use_sdpa
@@ -423,6 +448,7 @@ class MultiheadA(nn.Module):
         return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
     
     def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None):
+        batch_size, seq_len = x.shape[:2]
         
         q = self.query(x)
         if kv_cache is None or xa is None or self.key not in kv_cache:
@@ -443,24 +469,51 @@ class MultiheadA(nn.Module):
         k = self._shape(k, k.size(1), batch)
         v = self._shape(v, v.size(1), batch)
 
+        is_causal = False
         if mask is not None:
-            if mask.dim() == 2:
-                mask = mask[:ctx, :ctx]
-                mask = mask.unsqueeze(0).unsqueeze(1)
-            elif mask.dim() == 3:
-                mask = mask.unsqueeze(1)
-            elif mask.dim() == 4:
-                pass
-            else:
-                raise ValueError(f"Unexpected mask dimensions: {mask.dim()}")
-            mask = mask.expand(batch, self.head, ctx, ctx)
+            if mask.dim() == 4 and mask.dtype == torch.bool:
+                is_causal = True
+            elif mask.dim() <= 3:
+                mask = create_attention_mask(
+                    batch_size=batch,
+                    seq_len=ctx,
+                    is_causal=True,
+                    device=q.device
+                )
+                is_causal = True
 
         if MultiheadA.use_sdpa:
-            a = scaled_dot_product_attention(q, k, v, is_causal=mask is not None and ctx > 1, scale=scale)
-            out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
-            qk = None
-        return out, qk
+            try:
+                a = scaled_dot_product_attention(
+                    q, k, v, 
+                    attn_mask=mask if mask is not None and mask.dim() == 4 else None,
+                    is_causal=is_causal,
+                    scale=scale
+                )
+                out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
+                return out, None
+            except RuntimeError:
+                pass
+                
+        attn = torch.matmul(q, k.transpose(-1, -2)) * scale
+        
+        if mask is not None:
+            if mask.dim() == 4:
+                mask_q_len = min(mask.size(2), q.size(2))
+                mask_k_len = min(mask.size(3), k.size(2))
+                attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len].masked_fill(
+                    mask[:, :, :mask_q_len, :mask_k_len], float("-inf")
+                )
+        
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(batch, ctx, dims)
+        
+        return out, attn
+    
 
+
+# %%
 class ProjectionModule(nn.Module):
     """Unified projection module that handles query, key, and value transformations."""
     def __init__(self, dims: int, head: int, proj_type: str = "query", use_bias: bool = True):
@@ -488,43 +541,49 @@ class ProjectionModule(nn.Module):
             proj = proj * self.scale
         return proj
 
-def prepare_mask_for_attention(attn, mask):
-    """Prepares and applies mask to attention scores."""
-    batch, head, q_len, k_len = attn.shape
-    
-    if mask.dim() == 2:
-        mask_len = min(mask.size(0), q_len)
-        mask_to_apply = mask[:mask_len, :mask_len]
-        attn[:, :, :mask_len, :mask_len] = attn[:, :, :mask_len, :mask_len] + mask_to_apply
-    elif mask.dim() == 3:
-        mask_len = min(mask.size(1), q_len)
-        mask_to_apply = mask[:, :mask_len, :mask_len]
-        attn[:, :, :mask_len, :mask_len] = attn[:, :, :mask_len, :mask_len] + mask_to_apply.unsqueeze(1)
-    elif mask.dim() == 4:
-        mask_q_len = min(mask.size(2), q_len)
-        mask_k_len = min(mask.size(3), k_len)
-        attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len] + mask[:, :, :mask_q_len, :mask_k_len]
-    
-    return attn
-
 def calculate_attention(q, k, v, mask=None, temperature=1.0, use_sdpa=True):
-    """Shared attention calculation logic."""
+    """Attention calculation with zero-padding for invalid tokens."""
     if use_sdpa:
         try:
-            is_causal = mask is not None and q.size(2) > 1
-            attn_output = scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+            if mask is not None:
+                if mask.dtype == torch.bool:
+                    float_mask = torch.zeros_like(mask, dtype=torch.float)
+                    float_mask = float_mask.masked_fill(mask, float('-inf'))
+                    attn_output = scaled_dot_product_attention(
+                        q, k, v, attn_mask=float_mask)
+                else:
+                    attn_output = scaled_dot_product_attention(
+                        q, k, v, attn_mask=mask)
+            else:
+                attn_output = scaled_dot_product_attention(
+                    q, k, v, attn_mask=None)
             return attn_output, None
         except RuntimeError:
             pass
-    
-    attn = torch.matmul(q, k.transpose(-1, -2))
+    scale = 1.0 / temperature if temperature > 0 else 1.0
+    attn = torch.matmul(q, k.transpose(-1, -2)) * scale
     
     if mask is not None:
-        attn = prepare_mask_for_attention(attn, mask)
+        if mask.dim() == 4:
+            q_len, k_len = q.size(2), k.size(2)
+            mask_q_len = min(mask.size(2), q_len)
+            mask_k_len = min(mask.size(3), k_len)
+            
+            if mask.dtype == torch.bool:
+                mask_part = mask[:, :, :mask_q_len, :mask_k_len]
+                attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len].masked_fill(
+                    mask_part, float("-inf")
+                )
+            else:
+                attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len] + mask[:, :, :mask_q_len, :mask_k_len]
+    attn = F.softmax(attn, dim=-1)
     
-    attn = F.softmax(attn / temperature, dim=-1)
+    if mask is not None and mask.dtype == torch.bool:
+        binary_mask = (~mask).float()
+        attn = attn * binary_mask
+        attn_sum = attn.sum(dim=-1, keepdim=True)
+        attn = attn / (attn_sum + 1e-6)
     attn_output = torch.matmul(attn, v)
-    
     return attn_output, attn
 
 class BaseAttention(nn.Module):
@@ -563,9 +622,7 @@ class AttentionCombiner(BaseAttention):
         else:
             batch = q.size(0)
             ctx = q.size(2)
-
         attn_output, _ = calculate_attention(q, k, v, mask, 1.0, BaseAttention.use_sdpa)
-        
         output = self._reshape_to_output(attn_output, batch, ctx)
         return self.out(output)
 
@@ -577,15 +634,11 @@ class AdaptiveUpdateAttention(BaseAttention):
         self.query_module = ProjectionModule(dims, head, "query")
         self.key_module = ProjectionModule(dims, head, "key")
         self.value_module = ProjectionModule(dims, head, "value")
-        
         self.combiner = AttentionCombiner(dims, head)
-        
         self.key_update_predictor = nn.Sequential(
-            Linear(dims, dims // 4), nn.ReLU(), Linear(dims // 4, 1), nn.Sigmoid()
-        )
+            Linear(dims, dims // 4), nn.ReLU(), Linear(dims // 4, 1), nn.Sigmoid())
         self.value_update_predictor = nn.Sequential(
-            Linear(dims, dims // 4), nn.ReLU(), Linear(dims // 4, 1), nn.Sigmoid()
-        )
+            Linear(dims, dims // 4), nn.ReLU(), Linear(dims // 4, 1), nn.Sigmoid())
 
         self.update_threshold = 0.5
         self.stored_key_cache = None
@@ -738,7 +791,9 @@ class AdaptiveSpan(BaseAttention):
         )
         
         with torch.autocast(device_type="cuda", enabled=torch.cuda.is_available()):
-            attn_output, weights = calculate_attention(q, k, v, None, temperature, BaseAttention.use_sdpa)
+            attn_output, weights = calculate_attention(
+                q, k, v, None, temperature, BaseAttention.use_sdpa
+            )
             out = self._reshape_to_output(attn_output, batch, eff_span)
 
         return out, weights
@@ -783,6 +838,19 @@ class MyelinatedLayer(BaseAttention):
         self.working_memory = nn.Parameter(torch.zeros(1, 1, dims))
         self.memory_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
         
+    def shared_head(self, norm_x, mask=None, kv_cache=None):
+        batch_size, seq_len = norm_x.shape[:2]
+        
+        q = norm_x.view(batch_size, seq_len, self.head, -1).transpose(1, 2)
+        k = norm_x.view(batch_size, seq_len, self.head, -1).transpose(1, 2)
+        v = norm_x.view(batch_size, seq_len, self.head, -1).transpose(1, 2)
+        
+        attn_output, _ = calculate_attention(q, k, v, mask, 1.0, BaseAttention.use_sdpa)
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        return attn_output
+
+
     def predict_node_importance(self, x, layer_idx):
         """Dynamically determine if processing should occur at this node"""
         importance = self.node_predictors[layer_idx](x)
@@ -854,8 +922,6 @@ class MyelinatedLayer(BaseAttention):
         return x, {'jumps': jump_history}
 
 
-
-
 class IntegratedAttention(nn.Module):
     """Combines local adaptive span and global content-dependent attention with RL-based adaptation."""
     def __init__(self, ctx, dims, head, max_dist=512, win_size=256, max_span=384, temp_scale=0.01):
@@ -893,8 +959,16 @@ class IntegratedAttention(nn.Module):
 
     def forward(self, x, xa=None, mask=None, kv_cache=None):
         """Process input with integrated local and global attention."""
-        if mask is None:
-            mask = self.mask
+        batch_size, seq_len = x.shape[:2]
+        
+        if mask is None or mask.dim() != 4:
+            mask = create_attention_mask(
+                batch_size=batch_size, 
+                seq_len=seq_len,
+                is_causal=True,
+                device=x.device
+            )
+        
             
         local = self.ln_a(x)
         globe = self.ln_b(x)
@@ -968,10 +1042,10 @@ class IntegratedAttention(nn.Module):
         dtype = next(self.parameters()).dtype
         span_scale = torch.tensor([span_value], device=device, dtype=dtype)
         return span_scale
-    
+        
     @autocast('cuda', enabled=True)
-    def _focus(self, query, key, value, span_scale, mask):
-        """Iterative attention refinement."""
+    def _focus(self, query, key, value, span_scale, mask=None):
+        """Iterative attention refinement with zero-padding for invalid tokens."""
         max_iterations = 10
         iteration = 0
         prev_attn = torch.zeros_like(input=query)
@@ -1004,20 +1078,32 @@ class IntegratedAttention(nn.Module):
             else:
                 temperature = 0.5 + self.temp_scale * span_scale.mean().item()
             
-            if mask is not None and (mask.size(-2) != q.size(-2) or mask.size(-1) != k.size(-2)):
-                mask_q_len = min(mask.size(-2), q.size(-2))
-                mask_k_len = min(mask.size(-1), k.size(-2))
-                resized_mask = torch.ones(
-                    (batch, self.head, q.size(-2), k.size(-2)),
-                    device=mask.device,
-                    dtype=mask.dtype,
-                )
-                resized_mask[:, :, :mask_q_len, :mask_k_len] = mask[:, :, :mask_q_len, :mask_k_len]
-                mask_to_use = resized_mask
-            else:
-                mask_to_use = mask
+            scale = (dims // self.head) ** -0.5
+            attn = torch.matmul(q, k.transpose(-1, -2)) * scale
+            
+            if mask is not None:
+                if mask.dim() == 4:
+                    q_len, k_len = q.size(2), k.size(2)
+                    mask_q_len = min(mask.size(2), q_len)
+                    mask_k_len = min(mask.size(3), k_len)
+                    
+                    effective_mask = torch.zeros_like(attn)
+                    
+                    effective_mask[:, :, :mask_q_len, :mask_k_len] = mask[:, :, :mask_q_len, :mask_k_len].float() * float("-inf")
+                    
+                    attn = attn + effective_mask
+            
+            attn = F.softmax(attn, dim=-1)
+            
+            if mask is not None and mask.dim() == 4:
+                binary_mask = (mask == 0).float()
                 
-            attn_output, weights = calculate_attention(q, k, v, mask_to_use, temperature, BaseAttention.use_sdpa)
+                attn = attn * binary_mask
+                
+                attn_sum = attn.sum(dim=-1, keepdim=True)
+                attn = attn / (attn_sum + 1e-6)
+                
+            attn_output = torch.matmul(attn, v)
             attn_out = attn_output.transpose(1, 2).contiguous().view(batch, ctx, -1)
 
             diff = torch.abs(attn_out - prev_attn).mean()
@@ -1031,16 +1117,15 @@ class IntegratedAttention(nn.Module):
             iteration += 1
             
         return attn_out, attn_weights
-    
+
     @autocast('cuda', enabled=True)
-    def slide_win(self, x, win_size, span_len, span_scale, mask):
+    def slide_win(self, x, win_size, span_len, span_scale, mask=None):
         """Process input with sliding window attention."""
         batch, ctx, dims = x.size()
         self.batch = batch
         num_windows = (ctx + win_size - 1) // win_size
         output = torch.zeros_like(x)
         device = x.device
-        default_mask = None
 
         for i in range(num_windows):
             start_idx = i * win_size
@@ -1055,35 +1140,13 @@ class IntegratedAttention(nn.Module):
             key = x[:, key_start:key_end, :]
             value = key
 
+            window_mask = None
             if mask is not None:
                 if mask.dim() == 4:
                     window_mask = mask[:, :, start_idx:end_idx, key_start:key_end]
+                    
                     if window_mask.size(1) == 1:
                         window_mask = window_mask.expand(-1, self.head, -1, -1)
-                else:
-                    if (
-                        default_mask is None
-                        or default_mask.size(-2) != window_size
-                        or default_mask.size(-1) != span_size
-                    ):
-                        default_mask = torch.ones(
-                            (batch, self.head, window_size, span_size),
-                            device=device,
-                            dtype=torch.bool,
-                        )
-                    window_mask = default_mask
-            else:
-                if (
-                    default_mask is None
-                    or default_mask.size(-2) != window_size
-                    or default_mask.size(-1) != span_size
-                ):
-                    default_mask = torch.ones(
-                        (batch, self.head, window_size, span_size),
-                        device=device,
-                        dtype=torch.bool,
-                    )
-                window_mask = default_mask
 
             attn_out, _ = self._focus(
                 query=query,
@@ -1096,6 +1159,9 @@ class IntegratedAttention(nn.Module):
             output[:, start_idx:end_idx, :] = attn_out
 
         return output
+
+
+# %%
 
 class Residual(nn.Module):
     def __init__(self, dims: int, head: int, act: str, debug=False, cross_attention=False):
@@ -1241,28 +1307,31 @@ class TextDecoder(nn.Module):
         self.register_buffer("causal_mask", mask, persistent=False)
 
     def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None) -> Tensor:
+        batch_size = x.size(0)
         self.ctx = x.size(1)
-
-        causal_mask = torch.triu(torch.full((self.ctx, self.ctx), float('-inf')), diagonal=1)
-        padding_mask = (x != self.pad_token_id).unsqueeze(1).unsqueeze(2)
-        if padding_mask is not None:
-            combined_mask = causal_mask.unsqueeze(0).to(torch.device("cuda")).float() + padding_mask.to(torch.device("cuda")).float()    
-        else:
-            combined_mask = causal_mask.unsqueeze(0)
-
+        
+        mask = create_attention_mask(
+            batch_size=batch_size,
+            seq_len=self.ctx,
+            is_causal=True,
+            padding_mask=(x != self.pad_token_id),
+            device=x.device
+        )
+        
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
         x = (self.token_embedding(x) + self.positional_embedding[offset: offset + x.shape[-1]])
         x = self.positional_encoding(x)
         x = x.to(xa.dtype)
 
-        print(f"Mask shape before passing to MultiheadA: {combined_mask.shape}")
-        print(f"Mask values: {combined_mask}")
         for block in chain(self.blockA or [], self.blockB or []):
-            x = block(x, xa, mask=combined_mask, kv_cache=kv_cache)
+            x = block(x, xa, mask=mask, kv_cache=kv_cache)
 
         x = self.ln_dec(x)
         logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
         return logits
+
+
+# %%
 
 class Echo(nn.Module):
     
@@ -1427,6 +1496,9 @@ class Echo(nn.Module):
             if isinstance(module, MultiheadA) or isinstance(module, IntegratedAttention):
                 module.register_forward_hook(debug_attention_scores)
 
+
+
+# %%
 
 
 def ctx_to_samples(audio_ctx, hop_length):
@@ -1640,6 +1712,9 @@ def generate_predictions(model, input_features_encoded, tokenizer, device, batch
     return generated_ids
 
 
+# %%
+
+
 def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn, max_steps=10000, device='cuda', 
     accumulation_steps=1, clear_cache=True, log_interval=10, eval_interval=100, save_interval=1000, 
     warmup_steps=0, checkpoint_dir="checkpoint_dir", log_dir="log_dir"):
@@ -1811,6 +1886,9 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
     writer.close()
     progress_bar.close()
 
+
+# %%
+
 if __name__ == "__main__":
 
     checkpoint_dir = './output/checkpoints'
@@ -1927,10 +2005,6 @@ tb = program.TensorBoard()
 tb.configure(argv=[None, '--logdir', log_dir])
 url = tb.launch()
 print(f"TensorBoard started at {url}")
-
-
-
-
 
 
 
