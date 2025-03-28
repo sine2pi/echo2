@@ -1,7 +1,4 @@
-
-
 ```python
-# %%
 import os
 import math
 import warnings
@@ -46,7 +43,6 @@ tokenizer = WhisperTokenizer.from_pretrained(
     pretrained_model_name_or_path="openai/whisper-small")
 
 
-# %%
 @dataclass
 class Dimensions:
     vocab: int
@@ -59,6 +55,7 @@ class Dimensions:
     text_debug: int
     text_checkpoint: bool
     scale_text_embedding: bool
+    cross_attention: bool
     
     mels: int
     audio_ctx: int
@@ -191,8 +188,6 @@ class PositionalEncoding(nn.Module):
         x = x + pe
         return x
 
-
-# %%
 
 class RotaryEmbedding(nn.Module):
 
@@ -413,8 +408,6 @@ class RotaryEmbedding(nn.Module):
         return freqs
 
 
-# %%
-
 @contextmanager
 def disable_sdpa():
     prev_state = MultiheadA.use_sdpa
@@ -438,12 +431,22 @@ class MultiheadA(nn.Module):
         self.value = Linear(dims, dims)
         self.out = Linear(dims, dims)
 
-        self.rotary = RotaryEmbedding(
+        self.rotary1 = RotaryEmbedding(
             dim=dims//head,
-            use_quaternion=False,
+            theta=10000,
+            use_quaternion=True,
+            use_projection=False,
+            rot_scale=4.0,
+            rot_count=1
+        )
+
+        self.rotary2 = RotaryEmbedding(
+            dim=dims//head,
+            theta=-10000,
+            use_quaternion=True,
             use_projection=False,
             rot_scale=1.0,
-            rot_count=2
+            rot_count=4
         )
 
     def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
@@ -472,27 +475,20 @@ class MultiheadA(nn.Module):
         k = self._shape(k, k.size(1), batch)
         v = self._shape(v, v.size(1), batch)
 
+
         is_causal = False
         if mask is not None:
             if mask.dim() == 4 and mask.dtype == torch.bool:
                 is_causal = True
             elif mask.dim() <= 3:
-                mask = create_attention_mask(
-                    batch_size=batch,
-                    seq_len=ctx,
-                    is_causal=True,
-                    device=q.device
-                )
-                is_causal = True
-
+                mask = create_attention_mask(batch_size=batch, seq_len=ctx, is_causal=True, device=q.device)
+                is_causal = True             
+                
         if MultiheadA.use_sdpa:
             try:
                 a = scaled_dot_product_attention(
-                    q, k, v, 
-                    attn_mask=mask if mask is not None and mask.dim() == 4 else None,
-                    is_causal=is_causal,
-                    scale=scale
-                )
+                    q, k, v, attn_mask=mask if mask is not None and mask.dim() == 4 else None,
+                    is_causal=is_causal, scale=scale)
                 out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
                 return out, None
             except RuntimeError:
@@ -505,18 +501,14 @@ class MultiheadA(nn.Module):
                 mask_q_len = min(mask.size(2), q.size(2))
                 mask_k_len = min(mask.size(3), k.size(2))
                 attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len].masked_fill(
-                    mask[:, :, :mask_q_len, :mask_k_len], float("-inf")
-                )
-        
+                    mask[:, :, :mask_q_len, :mask_k_len], float("-inf"))
+
         attn = F.softmax(attn, dim=-1)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(batch, ctx, dims)
-        
         return out, attn
-    
 
 
-# %%
 class ProjectionModule(nn.Module):
     """Unified projection module that handles query, key, and value transformations."""
     def __init__(self, dims: int, head: int, proj_type: str = "query", use_bias: bool = True):
@@ -969,9 +961,7 @@ class IntegratedAttention(nn.Module):
                 batch_size=batch_size, 
                 seq_len=seq_len,
                 is_causal=True,
-                device=x.device
-            )
-        
+                device=x.device)
             
         local = self.ln_a(x)
         globe = self.ln_b(x)
@@ -1045,7 +1035,7 @@ class IntegratedAttention(nn.Module):
         dtype = next(self.parameters()).dtype
         span_scale = torch.tensor([span_value], device=device, dtype=dtype)
         return span_scale
-        
+
     @autocast('cuda', enabled=True)
     def _focus(self, query, key, value, span_scale, mask=None):
         """Iterative attention refinement with zero-padding for invalid tokens."""
@@ -1090,21 +1080,29 @@ class IntegratedAttention(nn.Module):
                     mask_q_len = min(mask.size(2), q_len)
                     mask_k_len = min(mask.size(3), k_len)
                     
-                    effective_mask = torch.zeros_like(attn)
-                    
-                    effective_mask[:, :, :mask_q_len, :mask_k_len] = mask[:, :, :mask_q_len, :mask_k_len].float() * float("-inf")
-                    
-                    attn = attn + effective_mask
+                    mask_part = mask[:, :, :mask_q_len, :mask_k_len]
+                    if mask_part.dtype == torch.bool:
+                        attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len].masked_fill(
+                            mask_part, float("-inf")
+                        )
+                    else:
+                        attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len] + mask_part
             
             attn = F.softmax(attn, dim=-1)
             
-            if mask is not None and mask.dim() == 4:
-                binary_mask = (mask == 0).float()
+            if mask is not None and mask.dtype == torch.bool:
+                q_len, k_len = q.size(2), k.size(2)
+                mask_q_len = min(mask.size(2), q_len)
+                mask_k_len = min(mask.size(3), k_len)
                 
-                attn = attn * binary_mask
+                binary_mask = (~mask[:, :, :mask_q_len, :mask_k_len]).float()
+                attn_to_mask = attn[:, :, :mask_q_len, :mask_k_len]
+                attn_to_mask = attn_to_mask * binary_mask
                 
-                attn_sum = attn.sum(dim=-1, keepdim=True)
-                attn = attn / (attn_sum + 1e-6)
+                attn_sum = attn_to_mask.sum(dim=-1, keepdim=True)
+                attn_to_mask = attn_to_mask / (attn_sum + 1e-6)
+                
+                attn[:, :, :mask_q_len, :mask_k_len] = attn_to_mask
                 
             attn_output = torch.matmul(attn, v)
             attn_out = attn_output.transpose(1, 2).contiguous().view(batch, ctx, -1)
@@ -1120,7 +1118,6 @@ class IntegratedAttention(nn.Module):
             iteration += 1
             
         return attn_out, attn_weights
-
     @autocast('cuda', enabled=True)
     def slide_win(self, x, win_size, span_len, span_scale, mask=None):
         """Process input with sliding window attention."""
@@ -1152,6 +1149,7 @@ class IntegratedAttention(nn.Module):
                         window_mask = window_mask.expand(-1, self.head, -1, -1)
 
             attn_out, _ = self._focus(
+    
                 query=query,
                 key=key,
                 value=value,
@@ -1164,18 +1162,16 @@ class IntegratedAttention(nn.Module):
         return output
 
 
-# %%
-
 class Residual(nn.Module):
-    def __init__(self, dims: int, head: int, act: str, debug=False, cross_attention=False):
+    def __init__(self, dims: int, head: int, act: str, cross_attention: bool, debug=False):
         if debug is True:
             print(f"Residual check:{dims} {head} {act}")
-
+        
         super().__init__()
         self.dims = dims
         self.head = head
         self.cross_attention = cross_attention
-
+        
         act_map = {
             "gelu": nn.GELU(),
             "relu": nn.ReLU(),
@@ -1225,7 +1221,6 @@ class AudioEncoder(nn.Module):
         self.layerA = layerA
         self.layerB = layerB
         self.checkpoint = checkpoint
-
         self.embed_scale = math.sqrt(dims) if scale_embedding else 1.0
 
         act_map = {
@@ -1240,10 +1235,9 @@ class AudioEncoder(nn.Module):
 
         self.conv1 = Conv1d(mels, dims, kernel_size=3, padding=1)
         self.conv2 = Conv1d(dims, dims, kernel_size=3, stride=2, padding=1)
-
         self.register_buffer("positional_embedding", sinusoids(ctx, dims))
 
-        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, act=act) 
+        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, act=act, cross_attention=False) 
                                                 for _ in range(layerA)]) if layerA > 0 else None)
 
         self.blockB = (nn.ModuleList([IntegratedAttention(ctx=ctx, dims=dims, head=head)
@@ -1271,6 +1265,7 @@ class AudioEncoder(nn.Module):
         assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
         x = (x + self.positional_embedding).to(x.dtype)
         x = x * self.embed_scale
+        
         for block in chain(self.blockA or [], self.blockB or []):
             x = block(x, mask=mask)
             if isinstance(x, tuple):
@@ -1281,7 +1276,8 @@ class AudioEncoder(nn.Module):
         return x
 
 class TextDecoder(nn.Module):
-    def __init__(self, vocab: int, ctx: int, dims: int, head: int, layerA: int, layerB: int, checkpoint: bool, act: str, debug=None):
+    def __init__(self, vocab: int, ctx: int, dims: int, head: int, layerA: int, layerB: int, 
+                 checkpoint: bool, act: str, cross_attention, debug=None):
         if debug == 2: 
             print(f"TextDecoder check: {vocab} {ctx} {dims} {head} {checkpoint} {act} {layerA} {layerB}")
         super().__init__()
@@ -1292,15 +1288,14 @@ class TextDecoder(nn.Module):
         self.layerA = layerA
         self.layerB = layerB
         self.act = act
-        self.pad_token_id = 0
-
+        self.pad_token_id = 50257 
+        self.cross_attention = cross_attention
         self.token_embedding = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
         self.positional_embedding = nn.Parameter(data=torch.empty(ctx, dims))
         self.positional_encoding = PositionalEncoding(ctx=ctx, dims=dims)
 
         self.ln_dec = RMSNorm(dims)
-
-        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, act=act, cross_attention=False) 
+        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, act=act, cross_attention=cross_attention) 
                                       for _ in range(layerA)]) if layerA > 0 else None)
 
         self.blockB = (nn.ModuleList([IntegratedAttention(ctx=ctx, dims=dims, head=head)
@@ -1313,19 +1308,19 @@ class TextDecoder(nn.Module):
         batch_size = x.size(0)
         self.ctx = x.size(1)
         
+        padding_mask = (x != 50257) & (x != 0)
+
         mask = create_attention_mask(
             batch_size=batch_size,
             seq_len=self.ctx,
             is_causal=True,
-            padding_mask=(x != self.pad_token_id),
-            device=x.device
-        )
-        
+            padding_mask=padding_mask,
+            device=x.device)
+
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
         x = (self.token_embedding(x) + self.positional_embedding[offset: offset + x.shape[-1]])
         x = self.positional_encoding(x)
         x = x.to(xa.dtype)
-
         for block in chain(self.blockA or [], self.blockB or []):
             x = block(x, xa, mask=mask, kv_cache=kv_cache)
 
@@ -1333,8 +1328,6 @@ class TextDecoder(nn.Module):
         logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
         return logits
 
-
-# %%
 
 class Echo(nn.Module):
     
@@ -1365,12 +1358,12 @@ class Echo(nn.Module):
             layerB=param.text_layerB,
             checkpoint=param.text_checkpoint,
             act=param.text_act,
+            cross_attention=param.cross_attention,
             debug=param.text_debug,
+
         )
 
-        all_head = torch.zeros(
-            self.param.text_layerA, self.param.text_head, dtype=torch.bool
-        )
+        all_head = torch.zeros(self.param.text_layerA, self.param.text_head, dtype=torch.bool)
         all_head[self.param.text_layerA // 2 :] = True
         self.register_buffer("alignment_head", all_head.to_sparse(), persistent=False)
 
@@ -1382,11 +1375,9 @@ class Echo(nn.Module):
     
     def set_alignment_head(self, dump: bytes):
         array = np.frombuffer(
-            gzip.decompress(base64.b85decode(dump)), dtype=bool
-        ).copy()
+            gzip.decompress(base64.b85decode(dump)), dtype=bool).copy()
         mask = torch.from_numpy(array).reshape(
-            self.param.text_layerA, self.param.text_head
-        )
+            self.param.text_layerA, self.param.text_head)
         self.register_buffer("alignment_head", mask.to_sparse(), persistent=False)
 
     def embed_audio(self, input_features: torch.Tensor):
@@ -1396,7 +1387,6 @@ class Echo(nn.Module):
         return self.decoder(input_ids, audio_features)
 
     def forward(self, input_features: torch.Tensor, input_ids=None, labels=None, decoder_inputs_embeds=None) -> Dict[str, torch.Tensor]:
-
         if input_ids is None and decoder_inputs_embeds is None:
             if labels is not None:
                 input_ids = shift_tokens_right(
@@ -1411,7 +1401,6 @@ class Echo(nn.Module):
         if labels is not None:
             loss = F.cross_entropy(
                 logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=-100)
-        
         return {"logits": logits, "loss": loss, "labels": labels, "input_ids": input_ids}
 
     
@@ -1426,10 +1415,8 @@ class Echo(nn.Module):
     def install_kv_cache_hooks(self, cache: Optional[dict] = None):
         cache = {**cache} if cache is not None else {}
         hooks = []
-
         def save_to_cache(module, _, output):
             if module not in cache or output.shape[1] > self.param.text_ctx:
-    
                 cache[module] = output
             else:
                 cache[module] = torch.cat([cache[module], output], dim=1).detach()
@@ -1499,9 +1486,35 @@ class Echo(nn.Module):
             if isinstance(module, MultiheadA) or isinstance(module, IntegratedAttention):
                 module.register_forward_hook(debug_attention_scores)
 
+    def _init_weights(self, module):
+        std = 0.02
+        self.init_counts = {"Linear": 0, "Conv1d": 0, "LayerNorm": 0, "RMSNorm": 0}
 
-
-# %%
+        for name, module in self.named_modules():
+            if isinstance(module, Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                self.init_counts["Linear"] += 1
+            if isinstance(module, Conv1d):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                self.init_counts["Conv1d"] += 1
+            if isinstance(module, LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+                self.init_counts["LayerNorm"] += 1
+            if isinstance(module, RMSNorm):
+                nn.init.ones_(module.weight)
+                self.init_counts["RMSNorm"] += 1
+                
+    def init_weights(self):
+        print("Initializing all weights")
+        self.apply(self._init_weights)
+        print("Initialization summary:")
+        for module_type, count in self.init_counts.items():
+            print(f"{module_type}: {count}")
 
 
 def ctx_to_samples(audio_ctx, hop_length):
@@ -1574,8 +1587,7 @@ def process_audio(audio, audio_ctx, mels, hop_length, n_fft, sr):
         sample_rate=sr,
         n_fft=n_fft,
         hop_length=hop_length,
-        n_mels=mels,
-    )
+        n_mels=mels)
     
     mel_spectrogram = transform(audio)
 
@@ -1588,9 +1600,7 @@ def process_audio(audio, audio_ctx, mels, hop_length, n_fft, sr):
     
     return log_mel
 
-tokenizer = WhisperTokenizer.from_pretrained(
-    pretrained_model_name_or_path="openai/whisper-small"
-)
+tokenizer = WhisperTokenizer.from_pretrained(pretrained_model_name_or_path="openai/whisper-small")
 
 class DataCollator:
     def __init__(self, tokenizer, audio_ctx, text_ctx, mels, n_fft, hop_length, sample_rate=16000, device="cpu"):
@@ -1620,8 +1630,8 @@ class DataCollator:
                 mels=self.mels,
                 hop_length=self.hop_length,
                 n_fft=self.n_fft,
-                sr=self.sample_rate,
-            )
+                sr=self.sample_rate)
+            
             time_frames = audio.shape[-1]
             max_time_frames = max(max_time_frames, time_frames)
             
@@ -1637,28 +1647,26 @@ class DataCollator:
             processed_features.append({
                 "audio": audio,
                 "decoder_input": decoder_input,
-                "labels": labels
-            })
+                "labels": labels})
         
         max_text_length = min(max_text_length, self.text_ctx)
         
         batch_audio = torch.zeros(
             size=(batch, self.mels, max_time_frames),
             dtype=torch.float32,
-            device=self.device,
-        )
+            device=self.device)
+        
         batch_input_ids = torch.full(
             size=(batch, max_text_length),
             fill_value=self.pad_token_id,
             dtype=torch.long,
-            device=self.device,
-        )
+            device=self.device)
+        
         batch_labels = torch.full(
             size=(batch, max_text_length),
             fill_value=-100,
             dtype=torch.long,
-            device=self.device,
-        )
+            device=self.device)
 
         for i, feature in enumerate(processed_features):
             audio = feature["audio"]
@@ -1714,13 +1722,9 @@ def generate_predictions(model, input_features_encoded, tokenizer, device, batch
             break
     return generated_ids
 
-
-# %%
-
-
 def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn, max_steps=10000, device='cuda', 
     accumulation_steps=1, clear_cache=True, log_interval=10, eval_interval=100, save_interval=1000, 
-    warmup_steps=0, checkpoint_dir="checkpoint_dir", log_dir="log_dir"):
+    warmup_steps=0, checkpoint_dir="checkpoint_dir", log_dir="log_dir", skip_first_eval=True):
     
     model.to(device)
     global_step = 0
@@ -1730,6 +1734,7 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
     total_loss = 0
     step_in_report = 0
     dataset_epochs = 0
+    metrics = {"wer": float('nan')}
 
     if warmup_steps > 0:
         def warmup_lambda(step):
@@ -1797,18 +1802,20 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
         end_time = time.time()
         samples_per_sec = len(batch['input_features']) / (end_time - start_time)
 
-        if global_step % log_interval == 0:
-            if warmup_steps > 0 and global_step < warmup_steps:
-                lr = optimizer.param_groups[0]['lr']
-            else:
-                lr = scheduler.get_last_lr()[0]
-                
-            writer.add_scalar(tag='Loss/train', scalar_value=total_loss / (global_step + 1), global_step=global_step)
+        in_warmup = warmup_steps > 0 and global_step < warmup_steps
+        
+        if global_step % log_interval == 0 and not in_warmup:
+            lr = scheduler.get_last_lr()[0]
+             
+            writer.add_scalar(tag='Loss/train', scalar_value=total_loss / (step_in_report or 1), global_step=global_step)
             writer.add_scalar(tag='LearningRate', scalar_value=lr, global_step=global_step)
             writer.add_scalar(tag='SamplesPerSec', scalar_value=samples_per_sec, global_step=global_step)
-            logging.info(f"Step {global_step} - Loss: {total_loss / (global_step + 1):.4f}, LR: {lr:.8f}")
+            logging.info(f"Step {global_step} - Loss: {total_loss / (step_in_report or 1):.4f}, LR: {lr:.8f}")
         
-        if global_step % eval_interval == 0:
+        should_evaluate = (global_step % eval_interval == 0 and not in_warmup and 
+                           not (skip_first_eval and global_step == 0))
+        
+        if should_evaluate:
             model.eval()
             eval_start_time = time.time()
             eval_loss = 0
@@ -1816,7 +1823,6 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
             all_labels = []
             batch_count = 0
             total_samples = 0
-
 
             with torch.no_grad():
                 for eval_batch in eval_loader:
@@ -1837,30 +1843,32 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
 
                     batch_count += 1
 
-            if warmup_steps > 0 and global_step < warmup_steps:
-                lr = optimizer.param_groups[0]['lr']
-            else:
                 lr = scheduler.get_last_lr()[0]
+                    
+                eval_time = time.time() - eval_start_time
+                loss_avg = eval_loss / batch_count if batch_count > 0 else 0
+                predictions = {"predictions": np.array(all_predictions, dtype=object), "label_ids": np.array(all_labels, dtype=object)}
+                metrics = compute_metrics(pred=predictions, tokenizer=tokenizer)
                 
-            eval_time = time.time() - eval_start_time
-            loss_avg = eval_loss / batch_count if batch_count > 0 else 0
-            predictions = {"predictions": np.array(all_predictions, dtype=object), "label_ids": np.array(all_labels, dtype=object)}
-            metrics = compute_metrics(pred=predictions, tokenizer=tokenizer)
+                wer_is_valid = 'wer' in metrics and metrics['wer'] > 0.01
+                
+                writer.add_scalar('Loss/eval', loss_avg, global_step)
+                if wer_is_valid:
+                    writer.add_scalar('WER', metrics['wer'], global_step)
+                writer.add_scalar('EvalSamples', total_samples, global_step)
+                writer.add_scalar('EvalTimeSeconds', eval_time, global_step)
+                
+                wer_display = f"{metrics['wer']:.2f}%" if wer_is_valid else "N/A (too low)"
+                print(f"STEP {global_step} • WER:{wer_display} • Loss:{loss_avg:.4f} • LR:{lr:.8f}")
+                print(f"PRED: '{metrics['pred_str'][0]}'")
+                print(f"REF : '{metrics['label_str'][0]}'")
+                print()
 
-            writer.add_scalar('Loss/eval', loss_avg, global_step)
-            writer.add_scalar('WER', metrics['wer'], global_step)
-            writer.add_scalar('EvalSamples', total_samples, global_step)
-            writer.add_scalar('EvalTimeSeconds', eval_time, global_step)
-            
-            print(f"STEP {global_step} • WER:{metrics['wer']:.2f}% • Loss:{loss_avg:.4f} • LR:{lr:.8f}")
-            print(f"PRED: '{metrics['pred_str'][0]}'")
-            print(f"REF : '{metrics['label_str'][0]}'")
-            print()
+                log_wer = metrics['wer'] if wer_is_valid else float('nan')
+                logging.info(f"EVALUATION STEP {global_step} - WER: {log_wer:.2f}%, Loss: {loss_avg:.4f}, LR: {lr:.8f}")
+                model.train()
 
-            logging.info(f"EVALUATION STEP {global_step} - WER: {metrics['wer']:.2f}%, Loss: {loss_avg:.4f}, LR: {lr:.8f}")
-            model.train()
-
-        if global_step % save_interval == 0:
+        if global_step % save_interval == 0 and not in_warmup and global_step > 0:
             checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_step_{global_step}.pt')
             torch.save(model.state_dict(), checkpoint_path)
             logging.info(f"Model saved at step {global_step} to {checkpoint_path}")
@@ -1873,13 +1881,21 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
         else:
             scheduler.step()
 
-        avg_loss = total_loss / (global_step + 1)
+        avg_loss = total_loss / (step_in_report or 1)
         if warmup_steps > 0 and global_step <= warmup_steps:
             lr = optimizer.param_groups[0]['lr']
+            wer_display = 'warmup'
         else:
             lr = scheduler.get_last_lr()[0]
+            wer_is_valid = 'wer' in metrics and not math.isnan(metrics["wer"]) and metrics["wer"] > 0.01
+            wer_display = f'{metrics["wer"]:.2f}' if wer_is_valid else 'N/A'
             
-        postfix_dict = {'loss': f'{avg_loss:.4f}', 'lr': f'{lr:.6f}', 'WER': f'{metrics["wer"]:.4f}' if 'wer' in metrics else 'N/A', 'samp/sec': f'{samples_per_sec:.1f}'}
+        postfix_dict = {
+            'loss': f'{avg_loss:.4f}', 
+            'lr': f'{lr:.6f}', 
+            'WER': wer_display, 
+            'samp/sec': f'{samples_per_sec:.1f}'
+        }
         progress_bar.set_postfix(postfix_dict, refresh=True)
         progress_bar.update(1)
 
@@ -1889,14 +1905,11 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
     writer.close()
     progress_bar.close()
 
-
-# %%
-
 if __name__ == "__main__":
 
     checkpoint_dir = './output/checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
-    log_dir = os.path.join("./output/logs/rottestresidual", datetime.now().strftime(format="%m-%d_%H"))
+    log_dir = os.path.join("./output/logs", datetime.now().strftime(format="%m-%d_%H-%M-%S"))
     os.makedirs(name=log_dir, exist_ok=True)
 
     logging.basicConfig(
@@ -1912,58 +1925,49 @@ if __name__ == "__main__":
         cache_dir="E:/cache",
     ).select_columns(column_names=["audio", "transcription"])
 
-
-    extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small", feature_size=80, sampling_rate=16000)
     tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small")
 
-    dataset = load_dataset(
-        path="mozilla-foundation/common_voice_17_0",
-        name="en",
-        streaming=True,
-        token=token,
-        trust_remote_code=True,
-        cache_dir="E:/cache",
-    ).select_columns(column_names=["audio", "sentence"]).rename_column("sentence", "transcription")
-   
     debug = None
     
     param = Dimensions(
-        mels=80,
+        mels=128,
         audio_ctx=1500,
-        audio_head=4,
-        audio_layerA=4,
+        audio_head=8,
+        audio_layerA=8,
         audio_layerB=0,
-        audio_dims=512,
+        audio_dims=1024,
         audio_act="gelu",
         audio_checkpoint=False,
         scale_audio_embedding=False,
         audio_debug=debug,
         vocab=len(tokenizer),
         text_ctx=448,
-        text_head=4,
-        text_layerA=4,
+        text_head=8,
+        text_layerA=8,
         text_layerB=0,
-        text_dims=512,
+        text_dims=1024,
         text_act="gelu",
         text_checkpoint=False,
         scale_text_embedding=False,
         text_debug=debug,
+        cross_attention=False,
         decoder_start_token_id = 50258,
         pad_token_id = tokenizer.pad_token_id,
         eos_token_id = tokenizer.eos_token_id
         )
     
     model = Echo(param=param).to('cuda')
+    model.init_weights()
+
+        
     DataCollator = DataCollator(tokenizer=tokenizer, 
                                 audio_ctx=param.audio_ctx, 
                                 text_ctx=param.text_ctx, 
                                 mels=param.mels, 
-                                n_fft=400,
-                                hop_length=160,
+                                n_fft=1024,
+                                hop_length=128,
                                 sample_rate=16000,
                                 device='cuda')
-
-
 
     train_dataloader = DataLoader(
         dataset=dataset["train"],
@@ -1976,10 +1980,10 @@ if __name__ == "__main__":
         batch_size=1,
         collate_fn=DataCollator,
         num_workers=0)
-    
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2.5e-4, weight_decay=0.025)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000, eta_min=0.0001, last_epoch=-1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.02)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=2000, eta_min=5e-6, last_epoch=-1)
+
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
         
     train_and_evaluate(model=model, 
@@ -1989,17 +1993,19 @@ if __name__ == "__main__":
         optimizer=optimizer, 
         scheduler=scheduler, 
         loss_fn=loss_fn, 
-        warmup_steps=100,
-        max_steps=1100,
+        warmup_steps=200,
+        max_steps=2100,
         device='cuda', 
         accumulation_steps=1, 
         clear_cache=False, 
-        log_interval=100,
+        log_interval=10,
         eval_interval=100, 
-        save_interval=1000,
+        save_interval=3000,
         checkpoint_dir=checkpoint_dir, 
-        log_dir=log_dir
+        log_dir=log_dir,
+        skip_first_eval=True,
         )
+
 
 
 from tensorboard import program
@@ -2012,9 +2018,4 @@ print(f"TensorBoard started at {url}")
 
 
 
-
-
-
 ```
-
-
