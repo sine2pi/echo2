@@ -1,6 +1,6 @@
 # Echo: Advanced Attention Speech Recognition
 
-Echo is a neural speech recognition model that implements innovative attention mechanisms for efficient audio transcription. This architecture features n-dimensional quaternion rotations and reinforcement learning attention adaptations.
+Echo is a neural speech recognition model that implements innovative attention mechanisms for efficient audio transcription. This architecture features n-dimensional quaternion rotations and reinforcement learning attention adaptations. The model leverages quaternion mathematics to implement rotational embeddings, Q-learning for adaptive attention spans, and working memory integration for long-range dependencies. The sliding window mechanism with adaptive focus enables efficient processing of audio signals by concentrating computation on the most informative segments.
 
 ## Key Features
 
@@ -10,6 +10,8 @@ Echo is a neural speech recognition model that implements innovative attention m
 - **Adaptive Focus Sliding Window**: Content-dependent windowing that dynamically allocates computation to important signal regions
 - **Node Importance Tracking**: Dynamic computational routing based on token relevance scores
 - **Integrated Attention**: Combines local and global attention with quality-based learning loops
+
+
 
 ## Usage
 
@@ -32,7 +34,7 @@ param = Dimensions(
     
     # Attention mechanism selection
     self_attention_type="myelinated",  # Options: "myelinated", "integrated", "adaptive"
-    cross_attention_type="myelinated", 
+    cross_attention_type="myelinated", # Options: "myelinated", "integrated", "adaptive"
     
     # Other parameters
     cross_attention=False,
@@ -56,11 +58,49 @@ logits = model.decoder(input_ids, encoded_audio)
 
 # Decode transcription
 transcription = tokenizer.decode(torch.argmax(logits, dim=-1)[0])
+
+        self.rotary1 = RotaryEmbedding(
+            dim=dims//head,
+            theta=10000,
+            use_quaternion=True,
+            use_projection=True, <- if you need more than 3 dimensions (else givens for 2Dn) 
+            rot_scale=4.0,
+            rot_count=1
+        )
+
+        self.rotary2 = RotaryEmbedding(
+            dim=dims//head,
+            theta=-6000, <-change direction
+            use_quaternion=False, <- falls back to regular RoPE
+            use_projection=False,
+            rot_scale=1.0,
+            rot_count=4
+        )
+
+      q = self.rotary1.rotate_queries_or_keys(q)
+      k = self.rotary2.rotate_queries_or_keys(k)
+      ... as many as you need
+        see code for more options
+
 ```
+ use_projection = True
+ 
+    The code projects to a new 3D dimension using a learned linear projection
+    Applies true quaternion rotations in this 3D space
+    Projects back to the original dimension using another learned projection
+    The projections are initialized as pseudo-inverses of each other
 
-## Technical Details
+ use_projection = False
+ 
+    Directly applies rotations in the original dimension
+    For dimensions > 3, it falls back to using multiple 2D Givens rotations
+    It does NOT use quaternion rotation except when exactly in 3D
+    Each pair of dimensions gets rotated separately in 2D planes
 
-Echo combines conventional transformer architecture with innovative attention mechanisms. The model leverages quaternion mathematics to implement rotational embeddings, Q-learning for adaptive attention spans, and working memory integration for long-range dependencies. The sliding window mechanism with adaptive focus enables efficient processing of audio signals by concentrating computation on the most informative segments.
+
+
+
+
 
 ## Requirements
 
