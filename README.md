@@ -40,7 +40,7 @@ param = Dimensions(
     
     # Attention mechanism selection
     self_attention_type="myelinated",  # Options: "myelinated", "integrated", "adaptive"
-    cross_attention_type="myelinated", 
+    cross_attention_type="myelinated",  # Options: "myelinated", "integrated", "adaptive"
     
     # Other parameters
     decoder_start_token_id=50258,
