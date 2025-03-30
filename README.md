@@ -1,4 +1,4 @@
-# Echo: Advanced Attention Speech Recognition
+## Echo: Advanced Attention Speech Recognition - Work in progress
 
 Echo is a neural speech recognition model that implements innovative attention mechanisms for efficient audio transcription. This architecture features n-dimensional quaternion rotations and reinforcement learning attention adaptations. The model leverages quaternion mathematics to implement rotational embeddings, Q-learning for adaptive attention spans, and working memory integration for long-range dependencies. The sliding window mechanism with adaptive focus enables efficient processing of audio signals by concentrating computation on the most informative segments.
 
