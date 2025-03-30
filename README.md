@@ -16,11 +16,6 @@ Echo is a neural speech recognition model that implements innovative attention m
 ## Usage
 
 ```python
-from modelc import Echo, Dimensions, process_audio
-from transformers import WhisperTokenizer
-
-# Initialize tokenizer
-tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small")
 
 # Configure model parameters
 param = Dimensions(
