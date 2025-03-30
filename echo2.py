@@ -1,3 +1,4 @@
+
 import os
 import math
 import warnings
@@ -22,7 +23,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from torch.utils.tensorboard.writer import SummaryWriter
 import evaluate
 from datasets import load_dataset
-from transformers import WhisperTokenizer, WhisperFeatureExtractor
+from transformers import WhisperTokenizer
 import transformers
 from tqdm.notebook import tqdm
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ tokenizer = WhisperTokenizer.from_pretrained(
     pretrained_model_name_or_path="openai/whisper-small")
 
 
+
 @dataclass
 class Dimensions:
     vocab: int
@@ -55,6 +57,8 @@ class Dimensions:
     text_checkpoint: bool
     scale_text_embedding: bool
     cross_attention: bool
+    cross_attention_type: str
+    self_attention_type: str
     
     mels: int
     audio_ctx: int
@@ -69,17 +73,31 @@ class Dimensions:
     pad_token_id: int
     eos_token_id: int
     decoder_start_token_id: int
-  
 
-def create_attention_mask(batch_size, seq_len, is_causal=True, padding_mask=None, device=None):
-    """Create a standardized attention mask for all attention mechanisms"""
+def visualize_mask(mask, title="Attention Mask"):
+    import matplotlib.pyplot as plt
+    
+    # Get first batch item and attention head
+    if mask.dim() == 4:
+        mask_vis = mask[0, 0].cpu().detach().numpy()
+    else:
+        mask_vis = mask.cpu().detach().numpy()
+    
+    plt.figure(figsize=(10, 8))
+    plt.imshow(mask_vis, cmap='viridis')
+    plt.title(title)
+    plt.colorbar()
+    plt.savefig(f"{title.replace(' ', '_')}.png")
+    plt.close()
+
+def create_attention_mask(batch_size, ctx, is_causal=True, padding_mask=None, device=None):
     if is_causal:
         mask = torch.triu(
-            torch.ones((seq_len, seq_len), device=device), diagonal=1
+            torch.ones((ctx, ctx), device=device), diagonal=1
         ).bool()
-        mask = mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
+        mask = mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, ctx, ctx)
     else:
-        mask = torch.zeros((batch_size, 1, seq_len, seq_len), device=device).bool()
+        mask = torch.zeros((batch_size, 1, ctx, ctx), device=device).bool()
     
     if padding_mask is not None:
         padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)
@@ -116,26 +134,19 @@ class RMSNorm(nn.Module):
 
 class Linear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
-        return F.linear(
-            x,
-            self.weight.to(x.dtype),
+        return F.linear(x, self.weight.to(x.dtype),
             None if self.bias is None else self.bias.to(x.dtype))
     
 class Conv1d(nn.Conv1d):
     def _conv_forward(
-        self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
-    ) -> Tensor:
-        return super()._conv_forward(
-            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
-        )
+        self, x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
+        return super()._conv_forward(x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype))
 
 class Conv2d(nn.Conv2d):
     def _conv_forward(
-        self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
-    ) -> Tensor:
+        self, x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
         return super()._conv_forward(
-            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
-        )
+            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype))
 
 class ParameterCycler:
     def __init__(self, parameters):
@@ -169,11 +180,11 @@ class PositionalEncoding(nn.Module):
         super(PositionalEncoding, self).__init__()
         self.dims = dims
         self.ctx = ctx
-        self.pe = self.get_positional_encoding(max_seq_len=ctx)
+        self.pe = self.get_positional_encoding(max_ctx=ctx)
         
-    def get_positional_encoding(self, max_seq_len):
-        pe = torch.zeros(max_seq_len, self.dims)
-        position = torch.arange(0, max_seq_len, dtype=torch.float32).unsqueeze(1)
+    def get_positional_encoding(self, max_ctx):
+        pe = torch.zeros(max_ctx, self.dims)
+        position = torch.arange(0, max_ctx, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, self.dims, 2, dtype=torch.float32) * (-math.log(10000.0) / self.dims))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
@@ -181,11 +192,13 @@ class PositionalEncoding(nn.Module):
         return pe.to(device)
     
     def forward(self, x):
-        seq_len = x.size(1)
-        pe = self.pe[:, :seq_len, :]
+        ctx = x.size(1)
+        pe = self.pe[:, :ctx, :]
         x = x * math.sqrt(self.dims)
         x = x + pe
         return x
+
+
 
 
 class RotaryEmbedding(nn.Module):
@@ -218,7 +231,6 @@ class RotaryEmbedding(nn.Module):
             
             self.thetas = nn.Parameter(torch.ones(len(self.pairs)) * (2 * math.pi / len(self.pairs)), 
                                       requires_grad=False)
-            
             if use_projection:
                 self.proj_down = None
                 self.proj_up = None
@@ -228,26 +240,19 @@ class RotaryEmbedding(nn.Module):
         return self.dummy.device
 
     def q_rotation(self, x, theta, u, v=None):
-
         eps = 1e-8
         u_norm = torch.norm(u, p=2)
         u = u / (u_norm + eps)
-        
         w = torch.cos(theta / 2)
         vec = torch.sin(theta / 2) * u
-        
         x_shape = x.shape
         x = x.reshape(-1, 3)
-        
         uv_cross = torch.cross(u.unsqueeze(0), x)
         uuv_cross = torch.cross(u.unsqueeze(0), uv_cross)
-        
         x_rot = x + torch.clamp(2 * (w * uv_cross + uuv_cross), min=-10.0, max=10.0)
-        
         return x_rot.reshape(*x_shape)
 
     def rotation_matrix(self, dims, i, j, theta):
-        """Create a rotation matrix for dimensions i,j with angle theta."""
         G = torch.eye(dims, device=theta.device)
         c, s = torch.cos(theta), torch.sin(theta)
         G[i, i], G[j, j] = c, c
@@ -261,39 +266,30 @@ class RotaryEmbedding(nn.Module):
             else:
                 Q = self.q_rotation(torch.eye(dims, device=theta.device), theta=theta, u=u, v=v)
             G = (G + Q) / 2
-            
         return G
 
     def rotations(self, x):
 
         direction = torch.sigmoid(self.dparam) * 2 - 1
         rotate = int(round(self.rscale * self.rot))
-        
         head_dim = x.shape[-1]
-        
         for k in range(min(rotate, len(self.pairs))):
             i, j = self.pairs[k].long()
             if i >= head_dim or j >= head_dim:
                 continue
-    
             theta = direction * self.thetas[k] * self.tscale
             G = self.rotation_matrix(dims=head_dim, i=i.item(), j=j.item(), theta=theta)
-            
             x_shape = x.shape
             x = x.reshape(-1, head_dim)
             x = x @ G
             x = x.reshape(*x_shape)
-        
         return x
 
     def _ensure_projectiolayerAs(self, x):
-      
         if self.proj_down is None or self.proj_down.weight.device != x.device:
             head_dim = x.shape[-1] 
-            
             self.proj_down = nn.Linear(head_dim, self.proj_dim, bias=False).to(x.device)
             self.proj_up = nn.Linear(self.proj_dim, head_dim, bias=False).to(x.device)
-            
             with torch.no_grad():
                 nn.init.orthogonal_(self.proj_down.weight, gain=self.proj_scale)
                 nn.init.orthogonal_(self.proj_up.weight, gain=self.proj_scale)
@@ -308,12 +304,10 @@ class RotaryEmbedding(nn.Module):
 
         orig_shape = x.shape
         x_flat = x.reshape(-1, x.shape[-1])
-        
         with torch.no_grad():
             x_norm = torch.norm(x_flat, dim=1, keepdim=True)
             if torch.max(x_norm) > 1e3:
                 x_flat = x_flat * (1e3 / torch.max(x_norm))
-        
         if x.shape[-1] > 3 and self.use_projection:
             self._ensure_projectiolayerAs(x)
             x_3d = self.proj_down(x_flat)
@@ -326,7 +320,6 @@ class RotaryEmbedding(nn.Module):
                 x_rot = self.proj_up(x_3d_rot)
             alpha = 0.9
             x_rot = alpha * x_rot + (1-alpha) * x_flat
-            
             if torch.isnan(x_rot).any():
                 return x.reshape(*orig_shape)
         else:
@@ -407,6 +400,7 @@ class RotaryEmbedding(nn.Module):
         return freqs
 
 
+
 @contextmanager
 def disable_sdpa():
     prev_state = MultiheadA.use_sdpa
@@ -436,8 +430,7 @@ class MultiheadA(nn.Module):
             use_quaternion=True,
             use_projection=False,
             rot_scale=4.0,
-            rot_count=1
-        )
+            rot_count=1)
 
         self.rotary2 = RotaryEmbedding(
             dim=dims//head,
@@ -445,15 +438,13 @@ class MultiheadA(nn.Module):
             use_quaternion=True,
             use_projection=False,
             rot_scale=1.0,
-            rot_count=4
-        )
+            rot_count=4)
 
     def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
-        """Reshape tensor to [batch, head, ctx, head_dim] with contiguous memory."""
         return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
     
     def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None):
-        batch_size, seq_len = x.shape[:2]
+        batch, ctx = x.shape[:2]
         
         q = self.query(x)
         if kv_cache is None or xa is None or self.key not in kv_cache:
@@ -462,7 +453,6 @@ class MultiheadA(nn.Module):
         else:
             k = kv_cache[self.key]
             v = kv_cache[self.value]
-
         wv, qk = self._attention(q, k, v, mask)
         return self.out(wv), qk
 
@@ -474,13 +464,15 @@ class MultiheadA(nn.Module):
         k = self._shape(k, k.size(1), batch)
         v = self._shape(v, v.size(1), batch)
 
+        # q = self.rotary1.rotate_qk(q)
+        # k = self.rotary2.rotate_qk(k)
 
         is_causal = False
         if mask is not None:
             if mask.dim() == 4 and mask.dtype == torch.bool:
                 is_causal = True
             elif mask.dim() <= 3:
-                mask = create_attention_mask(batch_size=batch, seq_len=ctx, is_causal=True, device=q.device)
+                mask = create_attention_mask(batch_size=batch, ctx=ctx, is_causal=True, device=q.device)
                 is_causal = True             
                 
         if MultiheadA.use_sdpa:
@@ -494,7 +486,6 @@ class MultiheadA(nn.Module):
                 pass
                 
         attn = torch.matmul(q, k.transpose(-1, -2)) * scale
-        
         if mask is not None:
             if mask.dim() == 4:
                 mask_q_len = min(mask.size(2), q.size(2))
@@ -507,9 +498,43 @@ class MultiheadA(nn.Module):
         out = out.transpose(1, 2).contiguous().view(batch, ctx, dims)
         return out, attn
 
+class MultiheadB(nn.Module):
+    def __init__(self, dims: int, head: int):
+        super().__init__()
+        self.head = head
+        self.query = Linear(dims, dims)
+        self.key = Linear(dims, dims, bias=False)
+        self.value = Linear(dims, dims)
+        self.out = Linear(dims, dims)
+
+    def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
+        return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
+
+    def forward(self, x: Tensor, xa: Optional[Tensor] = None, mask: Optional[Tensor] = None, kv_cache: Optional[dict] = None):
+        q = self.query(x)
+        if kv_cache is None or xa is None or self.key not in kv_cache:
+            k = self.key(x if xa is None else xa)
+            v = self.value(x if xa is None else xa)
+        else:
+            k = kv_cache[self.key]
+            v = kv_cache[self.value]
+        wv, qk = self.qkv_attention(q, k, v, mask)
+        return self.out(wv), qk
+
+    def qkv_attention(
+        self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch, ctx, dims = q.shape
+        scale = (dims // self.head) ** -0.25
+        q = self._shape(q, ctx, batch)
+        k = self._shape(k, k.size(1), batch)
+        v = self._shape(v, v.size(1), batch)
+        a = scaled_dot_product_attention(q, k, v, is_causal=mask is not None and ctx > 1, scale=scale)
+        out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
+        qk = None
+        return out, qk
+
 
 class ProjectionModule(nn.Module):
-    """Unified projection module that handles query, key, and value transformations."""
     def __init__(self, dims: int, head: int, proj_type: str = "query", use_bias: bool = True):
         super().__init__()
         assert dims % head == 0, f"dims ({dims}) must be divisible by head ({head})"
@@ -535,8 +560,7 @@ class ProjectionModule(nn.Module):
             proj = proj * self.scale
         return proj
 
-def calculate_attention(q, k, v, mask=None, temperature=1.0, use_sdpa=True):
-    """Attention calculation with zero-padding for invalid tokens."""
+def calculate_attention(q, k, v, mask=None, temperature=1.0, use_sdpa=True, is_causal=True):
     if use_sdpa:
         try:
             if mask is not None:
@@ -547,10 +571,10 @@ def calculate_attention(q, k, v, mask=None, temperature=1.0, use_sdpa=True):
                         q, k, v, attn_mask=float_mask)
                 else:
                     attn_output = scaled_dot_product_attention(
-                        q, k, v, attn_mask=mask)
+                        q, k, v, attn_mask=mask, is_causal=is_causal)
             else:
                 attn_output = scaled_dot_product_attention(
-                    q, k, v, attn_mask=None)
+                    q, k, v, attn_mask=None, is_causal=is_causal)
             return attn_output, None
         except RuntimeError:
             pass
@@ -565,18 +589,16 @@ def calculate_attention(q, k, v, mask=None, temperature=1.0, use_sdpa=True):
             
             if mask.dtype == torch.bool:
                 mask_part = mask[:, :, :mask_q_len, :mask_k_len]
-                attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len].masked_fill(
-                    mask_part, float("-inf")
-                )
+                attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len].masked_fill(mask_part, float("-inf"))
             else:
                 attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len] + mask[:, :, :mask_q_len, :mask_k_len]
     attn = F.softmax(attn, dim=-1)
     
     if mask is not None and mask.dtype == torch.bool:
         binary_mask = (~mask).float()
-        attn = attn * binary_mask
-        attn_sum = attn.sum(dim=-1, keepdim=True)
-        attn = attn / (attn_sum + 1e-6)
+        masked_attn = attn * binary_mask
+        attn_sum = masked_attn.sum(dim=-1, keepdim=True)
+        attn = masked_attn / (attn_sum + 1e-6)
     attn_output = torch.matmul(attn, v)
     return attn_output, attn
 
@@ -593,6 +615,10 @@ class BaseAttention(nn.Module):
         self.max_dist = max_dist
         self.scale = self.head_dim ** -0.25
         
+    def _shape(self, tensor: torch.Tensor, ctx: int, batch: int):
+        """Reshape tensor to [batch, head, ctx, head_dim] with contiguous memory."""
+        return tensor.view(batch, ctx, self.head, self.head_dim).transpose(1, 2).contiguous()
+        
     def _reshape_to_output(self, attn_output, batch, ctx):
         """Reshape attention output to original dimensions."""
         return attn_output.permute(0, 2, 1, 3).reshape(batch, ctx, self.dims)
@@ -606,17 +632,21 @@ class AttentionCombiner(BaseAttention):
         nn.init.zeros_(tensor=self.out.bias)
 
     @autocast('cuda', enabled=True)
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None, is_causal=True) -> Tensor:
         """Processes and combines attention inputs."""
         if q.dim() == 3:
-            batch, ctx, _ = q.shape
-            q = q.view(batch, ctx, self.head, self.head_dim).permute(0, 2, 1, 3)
-            k = k.view(batch, k.size(1), self.head, self.head_dim).permute(0, 2, 1, 3)
-            v = v.view(batch, v.size(1), self.head, self.head_dim).permute(0, 2, 1, 3)
+
+            batch, ctx, dims = q.shape
+            self.scale = (dims // self.head) ** -0.5
+
+            q = self._shape(q, ctx, batch)
+            k = self._shape(k, k.size(1), batch)
+            v = self._shape(v, v.size(1), batch)
+
         else:
             batch = q.size(0)
             ctx = q.size(2)
-        attn_output, _ = calculate_attention(q, k, v, mask, 1.0, BaseAttention.use_sdpa)
+        attn_output, _ = calculate_attention(q, k, v, mask, 1.0, BaseAttention.use_sdpa, is_causal=is_causal)
         output = self._reshape_to_output(attn_output, batch, ctx)
         return self.out(output)
 
@@ -648,12 +678,10 @@ class AdaptiveUpdateAttention(BaseAttention):
         avg_rep = x.mean(dim=1)
         return self.value_update_predictor(avg_rep) > self.update_threshold
 
-    def forward(self, x, xa=None, mask=None, kv_cache=None):
+    def forward(self, x, xa=None, mask=None, kv_cache=None, is_causal=True):
         """Process inputs with adaptive update mechanism."""
         batch, ctx, _ = x.shape
-        
         q = self.query_module(x)
-        
         kv_input = xa if xa is not None else x
         device = kv_input.device
 
@@ -666,7 +694,6 @@ class AdaptiveUpdateAttention(BaseAttention):
         else:
             update_k = self.should_update_key(kv_input)
             update_v = self.should_update_value(kv_input)
-            
             if update_k.any():
                 new_k = self.key_module(kv_input)
                 if self.stored_key_cache is not None:
@@ -676,7 +703,6 @@ class AdaptiveUpdateAttention(BaseAttention):
                     k = new_k
             else:
                 k = self.stored_key_cache if self.stored_key_cache is not None else self.key_module(kv_input)
-            
             if update_v.any():
                 new_v = self.value_module(kv_input)
                 if self.stored_value_cache is not None:
@@ -686,12 +712,9 @@ class AdaptiveUpdateAttention(BaseAttention):
                     v = new_v
             else:
                 v = self.stored_value_cache if self.stored_value_cache is not None else self.value_module(kv_input)
-            
             self.stored_key_cache = k
             self.stored_value_cache = v
-        
-        output = self.combiner(q, k, v, mask=mask)
-        
+        output = self.combiner(q, k, v, mask=mask, is_causal=is_causal)
         return output
 
 class Refiner:
@@ -751,7 +774,7 @@ class AdaptiveSpan(BaseAttention):
         self.span_scale = nn.Parameter(torch.tensor(1.0))
 
     @autocast('cuda', enabled=True)
-    def forward(self, query, key, value, max_dist=None, max_span=None, span_scale=None):
+    def forward(self, query, key, value, max_dist=None, max_span=None, span_scale=None, is_causal=True):
         if max_dist is None:
             max_dist = self.max_dist
         if max_span is None:
@@ -773,55 +796,40 @@ class AdaptiveSpan(BaseAttention):
 
         batch = q_span.shape[0]
 
-        reshape_dims = (batch, -1, self.head, self.head_dim)
-        q = q_span.view(*reshape_dims).permute(0, 2, 1, 3)
-        k = k_span.view(*reshape_dims).permute(0, 2, 1, 3)
-        v = v_span.view(*reshape_dims).permute(0, 2, 1, 3)
+        q = self._shape(q_span, q_span.size(1), batch)
+        k = self._shape(k_span, k_span.size(1), batch)
+        v = self._shape(v_span, v_span.size(1), batch)
 
-        temperature = (
-            1.0 + self.temp_scale * (1.0 - span_mean)
+        temperature = (1.0 + self.temp_scale * (1.0 - span_mean)
             if self.sharpen
-            else 0.5 + self.temp_scale * span_mean
-        )
+            else 0.5 + self.temp_scale * span_mean)
         
         with torch.autocast(device_type="cuda", enabled=torch.cuda.is_available()):
             attn_output, weights = calculate_attention(
-                q, k, v, None, temperature, BaseAttention.use_sdpa
-            )
+                q, k, v, None, temperature, BaseAttention.use_sdpa, is_causal=is_causal)
             out = self._reshape_to_output(attn_output, batch, eff_span)
-
         return out, weights
 
 class MyelinatedLayer(BaseAttention):
-    def __init__(self, dims, head, layerAs=6, sparsity_threshold=0.1):
-        super().__init__()
+    def __init__(self, dims, head, layerAs=3, sparsity_threshold=0.1, max_dist=512):
+        super().__init__(dims, head, max_dist)
         self.layers = nn.ModuleList()
         self.layerAs = layerAs
         self.sparsity_threshold = sparsity_threshold
+        self.max_dist = max_dist
         
-        self.shared_head = AdaptiveSpan(dims, head)
-        
+        self.adaptive_span = IntegratedAttention(dims, head)
         self.node_predictors = nn.ModuleList([
-            nn.Sequential(
-                LayerNorm(dims),
+            nn.Sequential(LayerNorm(dims),
                 Linear(dims, 1),
-                nn.Sigmoid()
-            ) for _ in range(layerAs)
-        ])
+                nn.Sigmoid()) for _ in range(layerAs)])
         
         for i in range(layerAs):
             self.layers.append(nn.ModuleDict({
                 'ln': LayerNorm(dims),
                 'gate': nn.Sequential(Linear(dims, 1), nn.Sigmoid()),
-                'adapter': Linear(dims, dims) if i % 2 == 0 else None
-            }))
-        
-        self.policy_net = nn.Sequential(
-            Linear(dims, 128),
-            nn.ReLU(),
-            Linear(128, 3)
-        )
-        
+                'adapter': Linear(dims, dims) if i % 2 == 0 else None}))
+        self.policy_net = nn.Sequential(Linear(dims, 128), nn.ReLU(), Linear(128, 3))
         self.jump_weights = nn.Parameter(torch.tensor([0.1, 0.05, 0.01]))
         
         n_mlp = dims * 4
@@ -832,140 +840,133 @@ class MyelinatedLayer(BaseAttention):
         self.working_memory = nn.Parameter(torch.zeros(1, 1, dims))
         self.memory_gate = nn.Sequential(Linear(dims, 1), nn.Sigmoid())
         
-    def shared_head(self, norm_x, mask=None, kv_cache=None):
-        batch_size, seq_len = norm_x.shape[:2]
+    # def compute_attention(self, norm_x, mask=None, kv_cache=None, is_causal=True):
+    #     """Compute attention using the selected adaptive attention mechanism."""
+    #     return self.adaptive_span(norm_x, xa=None, mask=mask, kv_cache=kv_cache, is_causal=is_causal)
         
-        q = norm_x.view(batch_size, seq_len, self.head, -1).transpose(1, 2)
-        k = norm_x.view(batch_size, seq_len, self.head, -1).transpose(1, 2)
-        v = norm_x.view(batch_size, seq_len, self.head, -1).transpose(1, 2)
+    def compute_attention(self, norm_x, mask=None, kv_cache=None, is_causal=True):
+        """Compute attention with adaptive span and content-dependent updates."""
+        batch, ctx = norm_x.shape[:2]
         
-        attn_output, _ = calculate_attention(q, k, v, mask, 1.0, BaseAttention.use_sdpa)
+        q = norm_x.view(batch, ctx, self.head, -1).transpose(1, 2)
+        k = norm_x.view(batch, ctx, self.head, -1).transpose(1, 2)
+        v = norm_x.view(batch, ctx, self.head, -1).transpose(1, 2)
         
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        attn_output, _ = calculate_attention(q, k, v, mask, 1.0, BaseAttention.use_sdpa, is_causal=is_causal)
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch, ctx, -1)
         return attn_output
-
 
     def predict_node_importance(self, x, layer_idx):
         """Dynamically determine if processing should occur at this node"""
         importance = self.node_predictors[layer_idx](x)
         return (importance > self.sparsity_threshold).float()
     
-    def forward(self, x, xa=None, mask=None, kv_cache=None):
-        batch_size, seq_len = x.shape[:2]
-        
-        working_memory = self.working_memory.expand(batch_size, -1, -1)
-        
+    def forward(self, x, xa=None, mask=None, kv_cache=None, is_causal=True):
+        batch, ctx = x.shape[:2]
+        working_memory = self.working_memory.expand(batch, -1, -1)
         original_x = x
-        
-        pooled_representation = x.mean(dim=1)
+        pooled_representation = x.mean(dim=1, keepdim=False)
         policy_logits = self.policy_net(pooled_representation)
         policy = F.softmax(policy_logits, dim=-1)
-        
         jump_history = []
         i = 0
         while i < self.layerAs:
             layer = self.layers[i]
-            
             node_importance = self.predict_node_importance(x, i)
-            
             if node_importance.mean() < 0.2 and i > 0:
                 i += 1
                 jump_history.append(i)
                 continue
-                
             norm_x = layer['ln'](x)
-            
-            attn_mask = mask
             if mask is None:
-                attn_mask = node_importance.squeeze(-1).unsqueeze(1).expand(-1, seq_len, -1)
+                node_importance_2d = node_importance.squeeze(-1)
+                attn_mask = node_importance_2d.unsqueeze(1)
             else:
-                attn_mask = mask * node_importance.squeeze(-1).unsqueeze(1).expand(-1, seq_len, -1)
-                
+                attn_mask = mask * node_importance.squeeze(-1).unsqueeze(1)
             if node_importance.mean() > 0.3:
-                attn_output = self.shared_head(norm_x, mask=attn_mask, kv_cache=kv_cache)[0]
+                attn_output = self.compute_attention(norm_x, mask=attn_mask, kv_cache=kv_cache)
                 
                 if layer['adapter'] is not None:
                     attn_output = layer['adapter'](attn_output)
-                
-                gate_value = layer['gate'](norm_x).unsqueeze(-1)
+                gate_value = layer['gate'](norm_x)
                 x = x + gate_value * attn_output
                 
-                memory_gate = self.memory_gate(x)
-                working_memory = memory_gate * working_memory + (1 - memory_gate) * x.mean(dim=1, keepdim=True)
-            
+                memory_gate = self.memory_gate(x.mean(dim=1, keepdim=True))
+                mean_x = x.mean(dim=1, keepdim=True)
+                working_memory = memory_gate * working_memory + (1 - memory_gate) * mean_x
+                torch.cuda.empty_cache()
             jump_prob = policy[:, 1] if i < self.layerAs - 1 else torch.zeros_like(policy[:, 1])
             should_jump = (torch.rand_like(jump_prob) < jump_prob).any()
-            
             if should_jump:
                 jump_length = torch.multinomial(policy, 1)[:, 0].max().item() + 1
                 
                 i_next = min(i + jump_length, self.layerAs - 1)
                 skip_weight = self.jump_weights[min(jump_length-1, 2)]
-                
+
                 x = x + skip_weight * original_x + (1-skip_weight) * working_memory
                 
                 i = i_next
                 jump_history.append(i)
             else:
                 i += 1
-        
+                
+        self.last_memory_gate_values = memory_gate.detach().clone()
         mlp_importance = self.mlp_gate(x)
         mlp_output = self.mlp(self.mlp_ln(x))
         x = x + mlp_importance * mlp_output
         
-        return x, {'jumps': jump_history}
-
+        return x
 
 class IntegratedAttention(nn.Module):
-    """Combines local adaptive span and global content-dependent attention with RL-based adaptation."""
-    def __init__(self, ctx, dims, head, max_dist=512, win_size=256, max_span=384, temp_scale=0.01):
+    def __init__(self, dims, head, max_dist=512, win_size=256, max_span=384, temp_scale=0.01):
         super().__init__()
         self.head = head
         self.max_dist = max_dist
-        self.ctx = ctx
+
         self.dims = dims
         self.max_span = max_span
         self.sliding_window = win_size
         self.temp_scale = temp_scale
         self.sharpen = True
         self.head_dim = dims // head
-        self.batch = None
 
-        self.refiner = Refiner(
-            states=10000, actions=10, alpha=0.1, gamma=0.9, epsilon=0.1
-        )
-        
+        self.refiner = Refiner(states=10000, actions=10, alpha=0.1, gamma=0.9, epsilon=0.1)
         self.span_pred = Predictor(dims=dims)
-        self.attn_local = AdaptiveSpan(
-            dims=dims, head=head, max_dist=max_dist, sharpen=True, temp_scale=temp_scale
-        )
-        self.attn_global = AdaptiveUpdateAttention(dims=dims, head=head, max_dist=max_dist)
         
-        self.projection = Linear(in_features=2 * dims, out_features=dims)
+        self.attn_local = AdaptiveSpan(
+            dims=dims, head=head, max_dist=max_dist, sharpen=True, temp_scale=temp_scale)
+        self.attn_global = AdaptiveUpdateAttention(dims=dims, head=head, max_dist=max_dist)
+        self.cross_attn = AttentionCombiner(dims=dims, head=head)
+        self.self_projection = Linear(in_features=2 * dims, out_features=dims)
+        self.cross_projection = Linear(in_features=dims, out_features=dims)
+        
         self.ln_a = LayerNorm(normalized_shape=dims)
         self.ln_b = LayerNorm(normalized_shape=dims)
+        self.ln_cross = LayerNorm(normalized_shape=dims)
 
         mask = torch.empty(max_span, max_span).fill_(float("-inf")).triu_(diagonal=1)
-        self.register_buffer("mask", mask, persistent=False)
+        self.register_buffer("causal_mask", mask, persistent=False)
         self.register_buffer("window_mask", None, persistent=False)
         self.register_buffer("threshold", torch.tensor(1e-4), persistent=False)
         self.register_buffer("s_factor", torch.tensor(0.1), persistent=False)
 
-    def forward(self, x, xa=None, mask=None, kv_cache=None):
-        """Process input with integrated local and global attention."""
-        batch_size, seq_len = x.shape[:2]
+    def forward(self, x, xa=None, mask=None, kv_cache=None, is_causal=True):
+        batch, ctx = x.shape[:2]
         
-        if mask is None or mask.dim() != 4:
-            mask = create_attention_mask(
-                batch_size=batch_size, 
-                seq_len=seq_len,
-                is_causal=True,
-                device=x.device)
+        if xa is not None:
+            x_norm = self.ln_cross(x)
             
+            cross_out = self.cross_attn(
+                q=x_norm, k=xa, v=xa, mask=None)
+            return self.cross_projection(cross_out)
+        
         local = self.ln_a(x)
         globe = self.ln_b(x)
 
-        globe_out = self.attn_global(globe, globe, globe)
+        globe_out = self.attn_global(globe, xa=None, mask=mask, kv_cache=kv_cache, is_causal=is_causal)
+        globe_out = self.cross_projection(globe_out)
+        
         freq_scale = self.span_pred(globe_out)
         state = self.extract(local)
         action = self.refiner.choose_action(state=state)
@@ -976,7 +977,6 @@ class IntegratedAttention(nn.Module):
         with torch.no_grad():
             current_win_size = max(1, int(self.sliding_window * span_mean))
             current_span_len = max(1, int(self.max_span * span_mean))
-
             effective_max = min(self.max_dist, local.size(1))
             local_max = min(self.max_dist, current_span_len, current_win_size)
             globe_max = effective_max
@@ -999,13 +999,12 @@ class IntegratedAttention(nn.Module):
                 state=state, action=action, reward=quality, next_state=next_state)
         
         combined = torch.cat([local_out, globe_out], dim=-1)
-        x = self.projection(combined)
-        return x
+        return self.self_projection(combined)
 
     def quality(self, output):
         """Calculate quality metric for reinforcement learning."""
         with torch.no_grad():
-            safe_output = output.clamp(min=1e-10)
+            safe_output = torch.clamp(output, min=1e-10)
             entropy = -(safe_output * torch.log(safe_output)).sum(-1).mean()
             coverage = (output > 0.01).float().mean()
             return float(coverage - 0.1 * entropy)
@@ -1013,8 +1012,9 @@ class IntegratedAttention(nn.Module):
     def extract(self, x):
         """Extract state features for RL agent."""
         with torch.no_grad():
-            meadims = x.mean(dim=(0, 1))
-            var_state = x.var(dim=(0, 1), unbiased=False)
+            pooled = x.reshape(-1, self.dims)
+            meadims = pooled.mean(dim=0)
+            var_state = pooled.var(dim=0, unbiased=False)
             state = torch.cat([meadims, var_state])
             state_id = self.discretize(state.cpu().numpy())
         return state_id
@@ -1023,8 +1023,8 @@ class IntegratedAttention(nn.Module):
         """Convert continuous state to discrete state ID."""
         bins = np.linspace(-1, 1, num=10)
         state_discrete = np.digitize(state, bins)
-        state_hash = hash(tuple(state_discrete))
-        state_id = state_hash % (self.refiner.states - 1)
+        state_hash = sum(val * (10**i) for i, val in enumerate(state_discrete[:20]))
+        state_id = int(state_hash % (self.refiner.states - 1))
         return state_id
 
     def action_scale(self, action):
@@ -1035,7 +1035,6 @@ class IntegratedAttention(nn.Module):
         span_scale = torch.tensor([span_value], device=device, dtype=dtype)
         return span_scale
 
-    @autocast('cuda', enabled=True)
     def _focus(self, query, key, value, span_scale, mask=None):
         """Iterative attention refinement with zero-padding for invalid tokens."""
         max_iterations = 10
@@ -1078,14 +1077,19 @@ class IntegratedAttention(nn.Module):
                     q_len, k_len = q.size(2), k.size(2)
                     mask_q_len = min(mask.size(2), q_len)
                     mask_k_len = min(mask.size(3), k_len)
-                    
                     mask_part = mask[:, :, :mask_q_len, :mask_k_len]
                     if mask_part.dtype == torch.bool:
-                        attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len].masked_fill(
-                            mask_part, float("-inf")
-                        )
+                        attn_part = attn[:, :, :mask_q_len, :mask_k_len]
+                        masked_attn_part = attn_part.masked_fill(mask_part, float("-inf"))
+                        new_attn = attn.clone()
+                        new_attn[:, :, :mask_q_len, :mask_k_len] = masked_attn_part
+                        attn = new_attn
                     else:
-                        attn[:, :, :mask_q_len, :mask_k_len] = attn[:, :, :mask_q_len, :mask_k_len] + mask_part
+                        attn_part = attn[:, :, :mask_q_len, :mask_k_len]
+                        masked_attn_part = attn_part + mask_part
+                        new_attn = attn.clone()
+                        new_attn[:, :, :mask_q_len, :mask_k_len] = masked_attn_part
+                        attn = new_attn
             
             attn = F.softmax(attn, dim=-1)
             
@@ -1095,13 +1099,15 @@ class IntegratedAttention(nn.Module):
                 mask_k_len = min(mask.size(3), k_len)
                 
                 binary_mask = (~mask[:, :, :mask_q_len, :mask_k_len]).float()
-                attn_to_mask = attn[:, :, :mask_q_len, :mask_k_len]
-                attn_to_mask = attn_to_mask * binary_mask
+                attn_part = attn[:, :, :mask_q_len, :mask_k_len]
+                masked_attn_part = attn_part * binary_mask
                 
-                attn_sum = attn_to_mask.sum(dim=-1, keepdim=True)
-                attn_to_mask = attn_to_mask / (attn_sum + 1e-6)
+                attn_sum = masked_attn_part.sum(dim=-1, keepdim=True)
+                normalized_attn_part = masked_attn_part / (attn_sum + 1e-6)
                 
-                attn[:, :, :mask_q_len, :mask_k_len] = attn_to_mask
+                new_attn = attn.clone()
+                new_attn[:, :, :mask_q_len, :mask_k_len] = normalized_attn_part
+                attn = new_attn
                 
             attn_output = torch.matmul(attn, v)
             attn_out = attn_output.transpose(1, 2).contiguous().view(batch, ctx, -1)
@@ -1112,19 +1118,18 @@ class IntegratedAttention(nn.Module):
             if diff < dynamic_threshold:
                 break
 
-            prev_attn = attn_out
+            prev_attn = attn_out.clone()
             query = query + attn_out
             iteration += 1
             
         return attn_out, attn_weights
+
     @autocast('cuda', enabled=True)
     def slide_win(self, x, win_size, span_len, span_scale, mask=None):
         """Process input with sliding window attention."""
         batch, ctx, dims = x.size()
-        self.batch = batch
         num_windows = (ctx + win_size - 1) // win_size
         output = torch.zeros_like(x)
-        device = x.device
 
         for i in range(num_windows):
             start_idx = i * win_size
@@ -1133,7 +1138,6 @@ class IntegratedAttention(nn.Module):
 
             key_start = max(0, start_idx - span_len + win_size)
             key_end = min(start_idx + span_len, ctx)
-            span_size = key_end - key_start
 
             query = x[:, start_idx:end_idx, :]
             key = x[:, key_start:key_end, :]
@@ -1148,18 +1152,35 @@ class IntegratedAttention(nn.Module):
                         window_mask = window_mask.expand(-1, self.head, -1, -1)
 
             attn_out, _ = self._focus(
-    
                 query=query,
                 key=key,
                 value=value,
                 span_scale=span_scale,
-                mask=window_mask,
-            )
-
+                mask=window_mask)
             output[:, start_idx:end_idx, :] = attn_out
-
         return output
 
+
+class AttentionWrapper(nn.Module):
+    """Wrapper to standardize attention layer interfaces"""
+    
+    def __init__(self, attention_layer):
+        super().__init__()
+        self.attention = attention_layer
+        
+    def forward(
+        self,
+        x: Tensor,
+        xa: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,
+        kv_cache: Optional[dict] = None
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        result = self.attention(x, xa, mask, kv_cache)
+        
+        if isinstance(result, tuple):
+            return result
+        else:
+            return (result, None)
 
 class Residual(nn.Module):
     def __init__(self, dims: int, head: int, act: str, cross_attention: bool, debug=False):
@@ -1171,15 +1192,9 @@ class Residual(nn.Module):
         self.head = head
         self.cross_attention = cross_attention
         
-        act_map = {
-            "gelu": nn.GELU(),
-            "relu": nn.ReLU(),
-            "sigmoid": nn.Sigmoid(),
-            "tanh": nn.Tanh(),
-            "leaky_relu": nn.LeakyReLU(),
-            "elu": nn.ELU(),
-        }
-
+        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(),
+            "tanh": nn.Tanh(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+        
         self.act = act_map.get(act, nn.GELU())
         
         self.attna = MultiheadA(dims=dims, head=head)
@@ -1205,14 +1220,77 @@ class Residual(nn.Module):
         x = x + self.mlp(self.lnb(x))
         return x
     
+class Residual2(nn.Module):
+    def __init__(self, dims: int, head: int, act: str, self_attention_type="default", cross_attention_type=None, debug=False):
+        if debug is True:
+            print(f"Residual check:{dims} {head} {act}")
+        
+        super().__init__()
+        self.dims = dims
+        self.head = head
+        self.self_attention_type = self_attention_type
+        self.cross_attention_type = cross_attention_type
 
+        if self_attention_type == "myelinated":
+            self_attn = MyelinatedLayer(dims=dims, head=head)
+        elif self_attention_type == "integrated":
+            self_attn = IntegratedAttention(dims=dims, head=head)
+        elif self_attention_type == "adaptive":
+            self_attn = AdaptiveUpdateAttention(dims=dims, head=head)
+        elif self_attention_type == "adaptive_span":
+            self_attn = AdaptiveSpan(dims=dims, head=head)
+        else:
+            self_attn = MultiheadB(dims=dims, head=head)
+        self.attna = AttentionWrapper(self_attn)
+
+        if cross_attention_type:
+            if cross_attention_type == "myelinated":
+                cross_attn = MyelinatedLayer(dims=dims, head=head)
+            elif cross_attention_type == "integrated":
+                cross_attn = IntegratedAttention(dims=dims, head=head)
+            elif cross_attention_type == "adaptive":
+                cross_attn = AdaptiveUpdateAttention(dims=dims, head=head)
+            elif cross_attention_type == "adaptive_span":
+                cross_attn = AdaptiveSpan(dims=dims, head=head)
+            elif cross_attention_type == "MultiheadB":
+                cross_attn = MultiheadB(dims=dims, head=head)
+            else:
+                cross_attn = None
+            self.attnc = AttentionWrapper(cross_attn) if cross_attn else None
+        else:
+            self.attnc = None
+       
+        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(),
+            "tanh": nn.Tanh(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+        self.act = act_map.get(act, nn.GELU())
+        
+        mlp = dims * 4
+        self.mlp = nn.Sequential(Linear(dims, mlp), self.act, Linear(mlp, dims))
+
+        self.lna = RMSNorm(dims)
+        self.lnb = RMSNorm(dims)
+        self.lnc = RMSNorm(dims) if cross_attention_type else None
+
+    def forward(
+        self,
+        x: Tensor,
+        xa: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,
+        kv_cache: Optional[dict] = None,
+    ):
+        attn_output, _ = self.attna(self.lna(x), mask=mask, kv_cache=kv_cache)
+        x = x + attn_output
+        if self.attnc and xa is not None:
+            cross_output, _ = self.attnc(self.lnc(x), xa, kv_cache=kv_cache)
+            x = x + cross_output
+        x = x + self.mlp(self.lnb(x))
+        return x
+    
 class AudioEncoder(nn.Module):
     def __init__(self, mels: int, ctx: int, dims: int, head: int, layerA: int, layerB: int, checkpoint: bool, act: str,  
-                 scale_embedding, debug=None):
+                 scale_embedding, self_attention_type, cross_attention_type, cross_attention, debug=None):
         if debug == 1:
-            print(
-                f"AudioEncoder check: {mels} {ctx} {dims} {head} {checkpoint} {act} {layerA} {layerB}"
-            )
+            print(f"AudioEncoder check: {mels} {ctx} {dims} {head} {checkpoint} {act} {layerA} {layerB}")
         super().__init__()
         self.ctx = ctx
         self.dims = dims
@@ -1221,27 +1299,26 @@ class AudioEncoder(nn.Module):
         self.layerB = layerB
         self.checkpoint = checkpoint
         self.embed_scale = math.sqrt(dims) if scale_embedding else 1.0
+        self.self_attention_type = self_attention_type
+        self.cross_attention_type = cross_attention_type
+        self.cross_attention = cross_attention
 
-        act_map = {
-            "gelu": nn.GELU(),
-            "relu": nn.ReLU(),
-            "sigmoid": nn.Sigmoid(),
-            "tanh": nn.Tanh(),
-            "leaky_relu": nn.LeakyReLU(),
-            "elu": nn.ELU()
-        }
+        act_map = {"gelu": nn.GELU(), "relu": nn.ReLU(), "sigmoid": nn.Sigmoid(),
+            "tanh": nn.Tanh(), "leaky_relu": nn.LeakyReLU(), "elu": nn.ELU()}
+        
         self.act = act_map.get(act, nn.GELU())
 
         self.conv1 = Conv1d(mels, dims, kernel_size=3, padding=1)
         self.conv2 = Conv1d(dims, dims, kernel_size=3, stride=2, padding=1)
         self.register_buffer("positional_embedding", sinusoids(ctx, dims))
 
-        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, act=act, cross_attention=False) 
+        self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, act=act, cross_attention=cross_attention) 
                                                 for _ in range(layerA)]) if layerA > 0 else None)
 
-        self.blockB = (nn.ModuleList([IntegratedAttention(ctx=ctx, dims=dims, head=head)
+        self.blockB = (nn.ModuleList([Residual2(dims=dims, head=head, act=act, self_attention_type=self_attention_type, 
+                                                cross_attention_type=cross_attention_type)
                                                 for _ in range(layerB)]) if layerB > 0 else None)
-        
+
         self.ln_enc = RMSNorm(dims)
         self.expected_ctxgth = ctx * self.conv1.stride[0] * self.conv2.stride[0]
 
@@ -1267,6 +1344,7 @@ class AudioEncoder(nn.Module):
         
         for block in chain(self.blockA or [], self.blockB or []):
             x = block(x, mask=mask)
+
             if isinstance(x, tuple):
                 x = x[0]
             else:
@@ -1275,30 +1353,35 @@ class AudioEncoder(nn.Module):
         return x
 
 class TextDecoder(nn.Module):
-    def __init__(self, vocab: int, ctx: int, dims: int, head: int, layerA: int, layerB: int, 
-                 checkpoint: bool, act: str, cross_attention, debug=None):
+    def __init__(self, vocab: int, ctx: int, dims: int, head: int, layerA: int, layerB: int, checkpoint: bool, act: str,  
+                 scale_embedding, self_attention_type, cross_attention_type, cross_attention, debug=None):
         if debug == 2: 
             print(f"TextDecoder check: {vocab} {ctx} {dims} {head} {checkpoint} {act} {layerA} {layerB}")
         super().__init__()
-        self.checkpoint = checkpoint
         self.ctx = ctx
         self.dims = dims
         self.head = head
         self.layerA = layerA
         self.layerB = layerB
-        self.act = act
-        self.pad_token_id = 50257 
+        self.checkpoint = checkpoint
+        self.embed_scale = math.sqrt(dims) if scale_embedding else 1.0
+        self.self_attention_type = self_attention_type
+        self.cross_attention_type = cross_attention_type
         self.cross_attention = cross_attention
+        self.pad_token_id = 50257 
+
+
         self.token_embedding = nn.Embedding(num_embeddings=vocab, embedding_dim=dims)
         self.positional_embedding = nn.Parameter(data=torch.empty(ctx, dims))
         self.positional_encoding = PositionalEncoding(ctx=ctx, dims=dims)
-
         self.ln_dec = RMSNorm(dims)
+
         self.blockA = (nn.ModuleList([Residual(dims=dims, head=head, act=act, cross_attention=cross_attention) 
                                       for _ in range(layerA)]) if layerA > 0 else None)
 
-        self.blockB = (nn.ModuleList([IntegratedAttention(ctx=ctx, dims=dims, head=head)
-                                      for _ in range(layerB)]) if layerB > 0 else None)
+        self.blockB = (nn.ModuleList([Residual2(dims=dims, head=head, act=act, self_attention_type=self_attention_type, 
+                                                cross_attention_type=cross_attention_type)
+                                                for _ in range(layerB)]) if layerB > 0 else None)
 
         mask = torch.empty(ctx, ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("causal_mask", mask, persistent=False)
@@ -1307,34 +1390,39 @@ class TextDecoder(nn.Module):
         batch_size = x.size(0)
         self.ctx = x.size(1)
         
-        padding_mask = (x != 50257) & (x != 0)
-
         mask = create_attention_mask(
             batch_size=batch_size,
-            seq_len=self.ctx,
+            ctx=self.ctx,
             is_causal=True,
-            padding_mask=padding_mask,
-            device=x.device)
-
+            padding_mask=(x != self.pad_token_id),
+            device=x.device)               
+        
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
         x = (self.token_embedding(x) + self.positional_embedding[offset: offset + x.shape[-1]])
         x = self.positional_encoding(x)
         x = x.to(xa.dtype)
+
         for block in chain(self.blockA or [], self.blockB or []):
             x = block(x, xa, mask=mask, kv_cache=kv_cache)
-
+    
         x = self.ln_dec(x)
         logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
         return logits
 
 
+
 class Echo(nn.Module):
-    
     def __init__(self, param: Dimensions, debug=None):
         super().__init__()
 
         self.debug = debug
         self.param = param
+
+        # Ensure these fields exist in your Dimensions dataclass
+        if not hasattr(param, 'self_attention_type'):
+            param.self_attention_type = "default"
+        if not hasattr(param, 'cross_attention_type'):
+            param.cross_attention_type = None
 
         self.encoder = AudioEncoder(
             mels=param.mels,
@@ -1346,8 +1434,12 @@ class Echo(nn.Module):
             checkpoint=param.audio_checkpoint,
             act=param.audio_act,
             scale_embedding=param.scale_audio_embedding,
+            cross_attention=param.cross_attention,
+            self_attention_type=param.self_attention_type,
+            cross_attention_type=param.cross_attention_type,
             debug=param.audio_debug,
         )
+        
         self.decoder = TextDecoder(
             vocab=param.vocab,
             ctx=param.text_ctx,
@@ -1357,9 +1449,11 @@ class Echo(nn.Module):
             layerB=param.text_layerB,
             checkpoint=param.text_checkpoint,
             act=param.text_act,
+            scale_embedding=param.scale_text_embedding,
             cross_attention=param.cross_attention,
+            self_attention_type=param.self_attention_type,
+            cross_attention_type=param.cross_attention_type,
             debug=param.text_debug,
-
         )
 
         all_head = torch.zeros(self.param.text_layerA, self.param.text_head, dtype=torch.bool)
@@ -1402,7 +1496,6 @@ class Echo(nn.Module):
                 logits.view(-1, logits.shape[-1]), labels.view(-1), ignore_index=-100)
         return {"logits": logits, "loss": loss, "labels": labels, "input_ids": input_ids}
 
-    
     @property
     def is_multilingual(self):
         return self.param.vocab >= 51865
@@ -1508,7 +1601,7 @@ class Echo(nn.Module):
                 nn.init.ones_(module.weight)
                 self.init_counts["RMSNorm"] += 1
                 
-    def init_weights(self):
+    def init_weights(self):  # noqa: F811
         print("Initializing all weights")
         self.apply(self._init_weights)
         print("Initialization summary:")
@@ -1562,14 +1655,10 @@ def pad(array, target_length, axis=-1, dtype: torch.dtype = torch.float32):
         if array.shape[axis] < target_length:
             pad_widths = [(0, 0)] * array.ndim
             pad_widths[axis] = (0, target_length - array.shape[axis])
-            array = F.pad(
-                input=array, pad=[pad for sizes in pad_widths[::-1] for pad in sizes]
-            )
+            array = F.pad(input=array, pad=[pad for sizes in pad_widths[::-1] for pad in sizes])
         array = array.to(dtype=dtype)
     else:
-        raise TypeError(
-            f"Unsupported input type: {type(array)}. Expected torch.Tensor or np.ndarray."
-        )
+        raise TypeError(f"Unsupported input type: {type(array)}. Expected torch.Tensor or np.ndarray.")
     return array
 
 def exact_div(x, y):
@@ -1589,17 +1678,15 @@ def process_audio(audio, audio_ctx, mels, hop_length, n_fft, sr):
         n_mels=mels)
     
     mel_spectrogram = transform(audio)
-
     target_frames = exact_div(n_samples, hop_length) 
     mel_spectrogram = pad(array=mel_spectrogram, target_length=target_frames, axis=-1)
-
     log_mel = torch.clamp(mel_spectrogram, min=1e-10).log10()
     log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
     log_mel = (log_mel + 4.0) / 4.0
-    
     return log_mel
 
-tokenizer = WhisperTokenizer.from_pretrained(pretrained_model_name_or_path="openai/whisper-small")
+tokenizer = WhisperTokenizer.from_pretrained(
+    pretrained_model_name_or_path="openai/whisper-small")
 
 class DataCollator:
     def __init__(self, tokenizer, audio_ctx, text_ctx, mels, n_fft, hop_length, sample_rate=16000, device="cpu"):
@@ -1640,9 +1727,7 @@ class DataCollator:
             
             decoder_input = [self.decoder_start_token_id] + encoded_input
             labels = encoded_label + [self.eos_token_id]
-            
             max_text_length = max(max_text_length, len(decoder_input), len(labels))
-            
             processed_features.append({
                 "audio": audio,
                 "decoder_input": decoder_input,
@@ -1672,7 +1757,6 @@ class DataCollator:
             time_frames = audio.shape[-1]
             decoder_input = feature["decoder_input"][:max_text_length]
             labels = feature["labels"][:max_text_length]
-            
             batch_audio[i, :, :time_frames] = torch.tensor(data=audio, dtype=torch.float32)
             batch_input_ids[i, :len(decoder_input)] = torch.tensor(data=decoder_input, dtype=torch.long)
             batch_labels[i, :len(labels)] = torch.tensor(data=labels, dtype=torch.long)
@@ -1680,8 +1764,7 @@ class DataCollator:
         return {
             "input_features": batch_audio,
             "input_ids": batch_input_ids,
-            "labels": batch_labels,
-        }
+            "labels": batch_labels}
 
 metric = evaluate.load(path="wer")
 
@@ -1704,7 +1787,6 @@ def compute_metrics(pred, tokenizer):
 def generate_predictions(model, input_features_encoded, tokenizer, device, batch_size, min_length):
     decoder_start_token_id = tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else 50258
     eos_token_id = tokenizer.eos_token_id if hasattr(tokenizer, 'eos_token_id') else 50257
-    
     generated_ids = torch.full(size=(batch_size, 1), fill_value=decoder_start_token_id, dtype=torch.long, device=device)
     
     max_length = 150
@@ -1721,10 +1803,13 @@ def generate_predictions(model, input_features_encoded, tokenizer, device, batch
             break
     return generated_ids
 
+
+
 def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, scheduler, loss_fn, max_steps=10000, device='cuda', 
     accumulation_steps=1, clear_cache=True, log_interval=10, eval_interval=100, save_interval=1000, 
     warmup_steps=0, checkpoint_dir="checkpoint_dir", log_dir="log_dir", skip_first_eval=True):
-    
+
+    import os
     model.to(device)
     global_step = 0
     scaler = torch.GradScaler()
@@ -1740,16 +1825,20 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
             if step < warmup_steps:
                 return float(step) / float(max(1, warmup_steps))
             return 1.0
-            
         warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
         logging.info(f"Using learning rate warmup for {warmup_steps} steps")
     else:
         warmup_scheduler = None
-
     progress_bar = tqdm(total=max_steps, desc="Training Progress", leave=True, colour='green')
-
     model.train()
     optimizer.zero_grad()
+    profiler = torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=1, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(log_dir),
+        record_shapes=True, profile_memory=True, with_stack=True)
+
+    profiler.start()
 
     while global_step < max_steps:
         try:
@@ -1800,9 +1889,7 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
 
         end_time = time.time()
         samples_per_sec = len(batch['input_features']) / (end_time - start_time)
-
         in_warmup = warmup_steps > 0 and global_step < warmup_steps
-        
         if global_step % log_interval == 0 and not in_warmup:
             lr = scheduler.get_last_lr()[0]
              
@@ -1839,7 +1926,6 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
                     eval_loss += loss.item()
                     all_predictions.extend(torch.argmax(decoder_output, dim=-1).cpu().numpy().tolist())
                     all_labels.extend(labels.cpu().numpy().tolist())
-
                     batch_count += 1
 
                 lr = scheduler.get_last_lr()[0]
@@ -1850,7 +1936,6 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
                 metrics = compute_metrics(pred=predictions, tokenizer=tokenizer)
                 
                 wer_is_valid = 'wer' in metrics and metrics['wer'] > 0.01
-                
                 writer.add_scalar('Loss/eval', loss_avg, global_step)
                 if wer_is_valid:
                     writer.add_scalar('WER', metrics['wer'], global_step)
@@ -1897,12 +1982,16 @@ def train_and_evaluate(model, tokenizer, train_loader, eval_loader, optimizer, s
         }
         progress_bar.set_postfix(postfix_dict, refresh=True)
         progress_bar.update(1)
-
+        profiler.step()
+        
+    profiler.stop()
     final_model_path = os.path.join(checkpoint_dir, 'final_model.pt')
     torch.save(model.state_dict(), final_model_path)
     print(f"Training completed after {global_step} steps. Final model saved to {final_model_path}")
     writer.close()
     progress_bar.close()
+
+
 
 if __name__ == "__main__":
 
@@ -1926,30 +2015,41 @@ if __name__ == "__main__":
 
     tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small")
 
+    # dataset = load_dataset(
+    #     path="mozilla-foundation/common_voice_17_0",
+    #     name="en",
+    #     streaming=True,
+    #     token=token,
+    #     trust_remote_code=True,
+    #     cache_dir="E:/cache",
+    # ).select_columns(column_names=["audio", "sentence"]).rename_column("sentence", "transcription")
+   
     debug = None
     
     param = Dimensions(
-        mels=128,
+        mels=80,
         audio_ctx=1500,
-        audio_head=8,
-        audio_layerA=8,
-        audio_layerB=0,
-        audio_dims=1024,
+        audio_head=2,
+        audio_layerA=2,
+        audio_layerB=1,
+        audio_dims=512,
         audio_act="gelu",
         audio_checkpoint=False,
         scale_audio_embedding=False,
         audio_debug=debug,
         vocab=len(tokenizer),
         text_ctx=448,
-        text_head=8,
-        text_layerA=8,
+        text_head=2,
+        text_layerA=2,
         text_layerB=0,
-        text_dims=1024,
+        text_dims=512,
         text_act="gelu",
         text_checkpoint=False,
         scale_text_embedding=False,
         text_debug=debug,
         cross_attention=False,
+        cross_attention_type="myelinated", ## applies to layerB - Change this to "myelinated", "adaptive" or "integrated" as needed default is multiheadB
+        self_attention_type="myelinated", ## applies to layerB - Change this to "myelinated", "adaptive" or "integrated" as needed default is multiheadB
         decoder_start_token_id = 50258,
         pad_token_id = tokenizer.pad_token_id,
         eos_token_id = tokenizer.eos_token_id
@@ -1958,30 +2058,29 @@ if __name__ == "__main__":
     model = Echo(param=param).to('cuda')
     model.init_weights()
 
-        
     DataCollator = DataCollator(tokenizer=tokenizer, 
                                 audio_ctx=param.audio_ctx, 
                                 text_ctx=param.text_ctx, 
                                 mels=param.mels, 
-                                n_fft=1024,
-                                hop_length=128,
+                                n_fft=400,
+                                hop_length=160,
                                 sample_rate=16000,
                                 device='cuda')
 
-    train_dataloader = DataLoader(
-        dataset=dataset["train"],
-        batch_size=1, 
-        collate_fn=DataCollator,
+    train_dataloader = DataLoader(dataset=dataset["train"],
+        batch_size=1, collate_fn=DataCollator,
         num_workers=0)
 
-    eval_dataloader = DataLoader(
-        dataset=dataset["test"].take(100),
-        batch_size=1,
-        collate_fn=DataCollator,
+    eval_dataloader = DataLoader(dataset=dataset["test"].take(100),
+        batch_size=1, collate_fn=DataCollator,
         num_workers=0)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.02)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=2000, eta_min=5e-6, last_epoch=-1)
+    # Original settings
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2.5e-4, weight_decay=0.025)
+    # warmup_steps=100
+
+    #optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.02)  # Reduced from 2.5e-4 to 1e-4
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=2000, eta_min=5e-6, last_epoch=-1)  # Lower min LR
 
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
         
@@ -1992,7 +2091,7 @@ if __name__ == "__main__":
         optimizer=optimizer, 
         scheduler=scheduler, 
         loss_fn=loss_fn, 
-        warmup_steps=200,
+        warmup_steps=100,
         max_steps=2100,
         device='cuda', 
         accumulation_steps=1, 
@@ -2004,6 +2103,8 @@ if __name__ == "__main__":
         log_dir=log_dir,
         skip_first_eval=True,
         )
+
+
 
 
 
