@@ -1,6 +1,6 @@
 
 
-#### Advanced Neural Network Optimizations and Embeddings
+#### Neural Network Optimizations and Embeddings
 
 This repository contains custom implementations of frequency-adaptive optimization algorithms and advanced rotary positional embeddings for transformers.
 
