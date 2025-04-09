@@ -2,7 +2,9 @@
 ### Neural Network Optimizations and Embeddings
 
 
-This repository contains custom implementations of frequency-adaptive optimization algorithms rotary positional embeddings and attentions for transformers and tranformer-like architectures that are nlp/asr focused.. These naturally lend themselves to vision and multimodal. I stress tranformer-like architectures. Layer variance is important and getting ourselves out of this transformer 100 identical layer rut is something that needs to happen. 
+This repository contains custom implementations of frequency-adaptive optimization algorithms rotary positional embeddings and attentions for transformers and tranformer-like architectures that are nlp/asr focused. These naturally lend themselves to vision and multimodal. 
+
+I stress tranformer-like architectures. Layer variance is important and getting ourselves out of this transformer 100 identical layer rut is something that needs to happen. 
 
 The full code for each snippet can found here can be found somewhere on this github. I'm an idea person so more often than not things I create might not be entirely pratical? but every once in awhile something kind of works so I post some of those here.  
 
