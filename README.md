@@ -1,6 +1,6 @@
 
+### Neural Network Optimizations and Embeddings
 
-#### Neural Network Optimizations and Embeddings
 
 This repository contains custom implementations of frequency-adaptive optimization algorithms and advanced rotary positional embeddings for transformers.
 
@@ -118,9 +118,7 @@ class FrequencyHandler:
  3. 3D rotary embeddings provide better sequence position understanding for long sequences
  4. Parameter-specific handling reduces overall computation while improving results
  
- ---
- 
- This repository contains custom implementations of attention mechanisms for neural language models and multimodal systems. 
+Attention mechanisms for neural language models and multimodal systems. 
  
  1. Adaptive Span Attention
      
@@ -143,7 +141,7 @@ class FrequencyHandler:
     Bio-inspired architecture with dynamic information routing
 
 
- Neural-inspired architecture that models the biological concept of myelin sheaths and nodes of Ranvier, enabling targeted computation and dynamic layer traversal based on content importance. Features reinforcement learning-based policy for optimized layer skipping.
+Neural-inspired architecture that models the biological concept of myelin sheaths and nodes of Ranvier, enabling targeted computation and dynamic layer traversal based on content importance. Features reinforcement learning-based policy for optimized layer skipping.
  
  3. Reinforcement Learning Enhanced Attention
      
@@ -155,7 +153,7 @@ class FrequencyHandler:
                  Q-learning for optimizing attention parameters
 
 
- Integration of Q-learning to dynamically refine attention parameters, allowing the model to learn optimal attention spans through exploration and exploitation during training.
+Integration of Q-learning to dynamically refine attention parameters, allowing the model to learn optimal attention spans through exploration and exploitation during training.
  
  4. Integrated Local-Global Attention
  
@@ -167,7 +165,7 @@ class FrequencyHandler:
                  Hybrid attention combining multiple mechanisms
 
 
- Combines sliding window attention with adaptive spans and global context awareness, creating a hybrid approach that balances efficiency and modeling capacity.
+Combines sliding window attention with adaptive spans and global context awareness, creating a hybrid approach that balances efficiency and modeling capacity.
  
  Content-Dependent Update Mechanisms
  
