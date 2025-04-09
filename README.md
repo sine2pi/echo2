@@ -4,14 +4,40 @@
 
 This repository contains custom implementations of frequency-adaptive optimization algorithms rotary positional embeddings and attentions for transformers and tranformer-like architectures that are nlp/asr focused. These naturally lend themselves to vision and multimodal. 
 
-I stress tranformer-like. Layer variance.
+I stress tranformer-like. 
+
+Layer variance, (just like mother nature intended).
+
+``` python
+    def create_encoder_layers(num_layers=10, dims=512):
+        variations = {
+            "activation": [nn.ReLU(), nn.GELU(), nn.SELU(), nn.LeakyReLU()],
+            "dropout": lambda: np.random.uniform(0.1, 0.3),
+            "head": lambda: np.random.choice([4, 8, 12]),
+            "norm_type": ["layernorm", "rmsnorm"]
+        }
+
+        layers = nn.ModuleList([
+            Residual(
+                dims=dims,
+                head=variations["head"](),
+                layer_idx=i,
+                act=np.random.choice(variations["activation"]),
+                decoder=False,
+                cross_attention=False
+            ) for i in range(num_layers)
+        ])
+        return layers
+
+```
 
 The full code for each snippet can found here can be found somewhere on this github. I'm an idea person so more often than not things I create might not be entirely pratical? but every once in awhile something kind of works so I post some of those here.  
 
 Frequency-Adaptive Momentum (FAM) Optimizer
 
-class FrequencyHandler:
+
 ```python
+class FrequencyHandler:
     def analyze(self, grad_sample, n_bands, eps=1e-8):
         """Frequency analysis implementation using FFT"""
         freq_repr = torch.fft.rfft(grad_sample.float())
