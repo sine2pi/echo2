@@ -2,8 +2,9 @@
 ### Neural Network Optimizations and Embeddings
 
 
-This repository contains custom implementations of frequency-adaptive optimization algorithms and advanced rotary positional embeddings for transformers.
-The full code for each snippet can found here can be found somewhere on this github.
+This repository contains custom implementations of frequency-adaptive optimization algorithms rotary positional embeddings and attentions for transformers and tranformer-like architectures that are nlp/asr focused.. These naturally lendi themselves well to vision and multimodal. I stress tranformer-like architectures.. Layer variance is important here folks! 
+
+The full code for each snippet can found here can be found somewhere on this github. I'm an idea person so more often than not things I create might not be entirely pratical? but every once in awhile something kind of works so I post some of those here.  
 
 Frequency-Adaptive Momentum (FAM) Optimizer
 
@@ -74,37 +75,38 @@ class FrequencyHandler:
  Implements quaternion-based 3D rotations for more expressive positional encoding, allowing rotations in higher-dimensional space that better preserve geometric relationships.
  
  2. Dynamic Projection
- 
+ ```python
          def project_and_rotate(self, x):
              Project high-dimensional vectors to 3D, rotate, then project back
             orig_shape = x.shape
             x_flat = x.reshape(-1, x.shape[-1])
              Projection to 3D and rotation logic
-
+```
  
  Projects high-dimensional embeddings into 3D space for rotation, then projects back to original dimensionality, enabling true geometric rotations even for high-dimensional embeddings.
  
  3. Learnable Rotation Parameters
- 
+ ```python
         def learned_rotations(self, rotations, t, start_index=0, freq_ranges=None):
             if exists(freq_ranges):
                 rotations = einsum('..., f -> ... f', rotations, freq_ranges)
                 rotations = rearrange(rotations, '... r f -> ... (r f)')
+```
  
  Supports learnable rotation parameters, allowing the model to adapt positional embeddings to specific sequence patterns.
  
  4. Compact Implementation
- 
+ ```python
          class CompactRotations:
             def __init__(self, dim, rot_pairs=None, rot_scale=1.0, rot_count=1, learned_freq=False):
                  Lightweight implementation with full flexibility
-
+```
  Provides a lightweight implementation option that maintains the core benefits while reducing computational overhead.
  
  Integration Architecture
  
  These components are designed to work together:
-
+```python
     model = TransformerModel(...)
     rotary = RotaryEmbedding(dim=model.dim, use_quaternion=True, proj_dim=3)
     optimizer = FAMOptimizer(
@@ -112,7 +114,7 @@ class FrequencyHandler:
         debug=True
     )
     scheduler = FAMScheduler(optimizer, warmup_epochs=5, max_epochs=100)
- 
+ ```
  
  1. FAM's frequency-adaptive momentum significantly reduces training instability, particularly for attention layers
  2. 15-30% faster convergence compared to Adam in transformer models
@@ -122,7 +124,7 @@ class FrequencyHandler:
 Attention mechanisms for neural language models and multimodal systems. 
  
  1. Adaptive Span Attention
-     
+```python
         class AdaptiveSpan(BaseAttention):
             """Attention with adaptive span size."""
             def __init__(self, dims, head, max_dist, sharpen=True, temp_scale=0.01):
@@ -130,59 +132,58 @@ Attention mechanisms for neural language models and multimodal systems.
                 self.sharpen = sharpen
                 self.temp_scale = temp_scale
                 self.span_scale = nn.Parameter(torch.tensor(1.0))
-
+```
 
  Dynamic adjustment of attention span based on content, optimizing computation while preserving modeling capacity. Effective for long sequences where full attention is unnecessary.
  
  2. MyelinatedLayer
-     
+```python
         class MyelinatedLayer(BaseAttention):
             def __init__(self, dims, head, layerA=3, sparsity_threshold=0.1, max_dist=512):
-
+```
     Bio-inspired architecture with dynamic information routing
 
 
 Neural-inspired architecture that models the biological concept of myelin sheaths and nodes of Ranvier, enabling targeted computation and dynamic layer traversal based on content importance. Features reinforcement learning-based policy for optimized layer skipping.
  
  3. Reinforcement Learning Enhanced Attention
-     
+```python
         class Refiner:
             def __init__(self, states, actions, alpha=0.1, gamma=0.9, epsilon=0.1):
                 self.states = states
                 self.actions = actions
                 self.R = {}
                  Q-learning for optimizing attention parameters
-
+```
 
 Integration of Q-learning to dynamically refine attention parameters, allowing the model to learn optimal attention spans through exploration and exploitation during training.
  
  4. Integrated Local-Global Attention
  
-
+```python
     
         class IntegratedAttention(nn.Module):
             """Combines local adaptive span and global content-dependent attention with RL-based adaptation."""
             def __init__(self, dims, head, max_dist=512, win_size=256, max_span=384, temp_scale=0.01):
                  Hybrid attention combining multiple mechanisms
 
-
+```
 Combines sliding window attention with adaptive spans and global context awareness, creating a hybrid approach that balances efficiency and modeling capacity.
  
  Content-Dependent Update Mechanisms
  
-
+```python
 
     def should_update_key(self, x: torch.Tensor) -> torch.Tensor:
         """Predict whether the key should be updated based on content."""
         avg_rep = x.mean(dim=1)
         return self.key_update_predictor(avg_rep) > self.update_threshold
-
-
+```
  Implements neural predictors that determine whether keys and values should be updated based on content.
  
  Dynamic Layer Skipping
  
-
+```python
     
     def decide_jump(self, policy, jump_weights, i, layerA, x, original_x, working_memory):
         """Decide whether to jump layers based on the policy network."""
@@ -190,26 +191,26 @@ Combines sliding window attention with adaptive spans and global context awarene
         should_jump = (torch.rand_like(jump_prob) < jump_prob).any()
          Layer skipping logic
 
-
+```
  Learns when to skip unnecessary computation through neural policy networks.
  
  Multi-Scale Processing
  
-
+```python
     def slide_win(self, x, win_size, span_len, span_scale, mask=None):
         """Process input with sliding window attention."""
         batch, ctx, dims = x.size()
         num_windows = (ctx + win_size - 1) // win_size
          Sliding window implementation
 
-
+```
  Rotary Embeddings
   
  - Implements quaternion mathematics for 3D rotations, enhancing positional encoding in transformer models.
  - Projects high-dimensional embeddings into 3D space for rotation and back to the original dimensionality, preserving geometric relationships.
  - Supports learnable rotation parameters, allowing the model to adapt positional embeddings dynamically.
  - Provides lightweight options for rotational embeddings, reducing computational overhead while maintaining flexibility.
-
+```python
         def q_rotation(self, x, theta, u, v=None):
             eps = 1e-8
             u_norm = torch.norm(u, p=2)
@@ -224,3 +225,4 @@ Combines sliding window attention with adaptive spans and global context awarene
             return x_rot.reshape(*x_shape)
         
 
+```
