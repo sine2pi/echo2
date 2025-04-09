@@ -3,11 +3,12 @@
 
 
 This repository contains custom implementations of frequency-adaptive optimization algorithms and advanced rotary positional embeddings for transformers.
+The full code for each snippet can found here can be found somewhere on this github.
 
 Frequency-Adaptive Momentum (FAM) Optimizer
 
 class FrequencyHandler:
-
+```python
     def analyze(self, grad_sample, n_bands, eps=1e-8):
         """Frequency analysis implementation using FFT"""
         freq_repr = torch.fft.rfft(grad_sample.float())
@@ -15,26 +16,26 @@ class FrequencyHandler:
          Normalize and divide into frequency bands
 
 
- 
+ ```
  
  1. Gradient Frequency Analysis
  The FAM optimizer analyzes gradient frequency spectra to dynamically adjust optimization parameters. This addresses the challenge that different parameter types (attention, embeddings, convolutions) require different update strategies.
  
  2. Parameter-Specific Handlers
-     
+```python
         class AttentionFrequencyHandler(FrequencyHandler):
             """Specialized handler for attention layers"""
             def analyze(self, grad_sample, n_bands, eps=1e-8):
                  Attention layers often have important high-frequency patterns
                  Use more bands in high frequencies
-         
+```         
  Each parameter type gets a specialized frequency handler that understands the unique update patterns required:
  - Uses logarithmically spaced bands to better capture convolution filter patterns
  - Emphasizes high-frequency components crucial for attention matrices
  - Applies more smoothing to stabilize embedding updates
  
  3. Adaptive Momentum Calculation
-     
+ ```python    
         def get_adaptive_momentum(self, band_values, base_alpha):
             """Dynamically adjust momentum based on frequency distribution"""
             n_bands = len(band_values)
@@ -43,7 +44,7 @@ class FrequencyHandler:
         if high_freq_activity > 0.3:
             return min(0.95, base_alpha + 0.05)
         return base_alpha
-
+```
   Dynamically adjusts momentum coefficients based on gradient frequency characteristics:
  - Higher momentum for high-frequency noise (smoother updates)
  - Lower momentum for meaningful low-frequency components (faster learning)
@@ -53,15 +54,15 @@ class FrequencyHandler:
  Includes debug tools to track frequency band distribution across training, helping identify optimization challenges. (this is mostly for my sanity)
  
  3D Rotary Embeddings
- 
+ ```python
     class RotaryEmbedding(nn.Module):
         def __init__(self, dim, theta=10000, num_freqs=1, learned_freq=True,
                     use_quaternion=False, rot_scale=1.0, rot_count=1, 
                     use_projection=False, proj_dim=3, proj_scale=0.1):
              Advanced rotary embedding implementation with 3D rotations
-
+```
  1. Quaternion-Based Rotations
- 
+ ```python
         def q_rotation(self, x, theta, u, v=None):
              Quaternion rotation implementation for 3D space
             eps = 1e-8
@@ -69,7 +70,7 @@ class FrequencyHandler:
             u = u / (u_norm + eps)
             w = torch.cos(theta / 2)
             vec = torch.sin(theta / 2) * u
- 
+ ```
  Implements quaternion-based 3D rotations for more expressive positional encoding, allowing rotations in higher-dimensional space that better preserve geometric relationships.
  
  2. Dynamic Projection
