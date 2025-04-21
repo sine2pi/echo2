@@ -1,12 +1,6 @@
+This repository contains custom implementations of frequency-adaptive optimization algorithms rotary positional embeddings and attentions for transformers and tranformer-like architectures that are nlp/asr focused. 
 
-### Neural Network Optimizations and Embeddings
-
-
-This repository contains custom implementations of frequency-adaptive optimization algorithms rotary positional embeddings and attentions for transformers and tranformer-like architectures that are nlp/asr focused. These naturally lend themselves to vision and multimodal. 
-
-I stress tranformer-like. 
-
-Layer variance, (just like mother nature intended).
+Layer variance.
 
 ``` python
     def create_encoder_layers(num_layers=10, dims=512):
@@ -30,8 +24,6 @@ Layer variance, (just like mother nature intended).
         return layers
 
 ```
-
-The full code for each snippet can found here can be found somewhere on this github. I'm an idea person so more often than not things I create might not be entirely pratical? but every once in awhile something kind of works so I post some of those here.  
 
 Frequency-Adaptive Momentum (FAM) Optimizer
 
@@ -80,7 +72,7 @@ class FrequencyHandler:
  
  4. Debug and Monitoring Tools
  
- Includes debug tools to track frequency band distribution across training, helping identify optimization challenges. (this is mostly for my sanity)
+ Includes debug tools to track frequency band distribution across training, helping identify optimization challenges.
  
  3D Rotary Embeddings
  ```python
